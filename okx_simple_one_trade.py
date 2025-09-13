@@ -31,7 +31,7 @@ CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "65"))
 
 # إعدادات التداول والهوامش
 TRADE_PCT = Decimal(os.getenv("TRADE_PCT", "0.90"))      # 90% من الإكويتي
-LEVERAGE = Decimal(os.getenv("LEVERAGE", "20"))
+LEVERAGE = Decimal(os.getenv("LEVERAGE", "10"))
 SAFETY = Decimal(os.getenv("SAFETY", "0.90"))            # هامش أمان إضافي
 RETRIES_51008 = int(os.getenv("RETRIES_51008", "4"))
 SHRINK_FACTOR = Decimal(os.getenv("SHRINK_FACTOR", "0.85"))
