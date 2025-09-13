@@ -29,6 +29,10 @@ TOP_N = 10
 NOTIONAL_USDT = Decimal(os.getenv("NOTIONAL_USDT", "90"))
 CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "65"))
 
+# نسبة من رأس المال للتداول (افتراضي 90%)
+TRADE_PCT = Decimal(os.getenv("TRADE_PCT", "0.90"))   # 0.90 = 90%
+MIN_NOTIONAL = Decimal(os.getenv("MIN_NOTIONAL", "10"))  # أقل قيمة اسمية نحاول بها (حماية)
+
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8367220857:AAHgvPb1pmAqHSwgixb9jBYCT2TTRrDnNL0"
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "1266351161"
 
@@ -114,6 +118,11 @@ def next_bar_boundary_ms(ms=None):
     period = BAR_SECONDS * 1000
     return ((ms // period) + 1) * period
 
+def next_hour_boundary_ms(ms=None):
+    ms = server_time_ms() if ms is None else ms
+    H = 3600 * 1000
+    return ((ms // H) + 1) * H
+
 def wait_until(target_ms, busy_ms=BUSY_WAIT_MS):
     while True:
         now = server_time_ms()
@@ -173,6 +182,22 @@ def get_fills(ordId=None, instId=None, limit=100):
     params["limit"] = limit
     res = _req("GET", "/api/v5/trade/fills", params)
     return res.get("data", [])
+
+def get_usdt_equity():
+    """يرجع إجمالي الإكويتي/الرصيد المتاح بـ USDT من حساب OKX (الديمو/الحقيقي)."""
+    try:
+        r = _req("GET", "/api/v5/account/balance", {"ccy": "USDT"})
+        d = r.get("data", [{}])[0]
+        eq = Decimal(str(d.get("totalEq") or "0"))
+        if eq == 0:
+            for it in d.get("details", []) or []:
+                if it.get("ccy") == "USDT":
+                    val = it.get("availEq") or it.get("eq") or it.get("cashBal")
+                    eq = Decimal(str(val or "0"))
+                    break
+        return max(eq, Decimal("0"))
+    except Exception:
+        return Decimal("0")
 
 # ====== INDICATORS ======
 def indicators(df, idx):
@@ -515,8 +540,21 @@ def main():
     if not (API_KEY and API_SECRET and API_PASSPHRASE):
         print("[ERR] Set API credentials"); return
     info = get_instruments_map()
+    hour_pnl_pos = Decimal("0")   # مجموع الأرباح الموجبة داخل الساعة
+    hour_pnl_neg = Decimal("0")   # مجموع الخسائر (قيم سالبة) داخل الساعة
+    next_hour_ms = next_hour_boundary_ms()
     while True:
         now_ms = server_time_ms()
+        if now_ms >= next_hour_ms:
+            net = (hour_pnl_pos + hour_pnl_neg)
+            _send_tg(
+                f"[ملخص الساعة] ربح إجمالي: {hour_pnl_pos:.2f} USDT | "
+                f"خسارة إجمالية: {abs(hour_pnl_neg):.2f} USDT | "
+                f"الصافي: {net:.2f} USDT"
+            )
+            hour_pnl_pos = Decimal("0")
+            hour_pnl_neg = Decimal("0")
+            next_hour_ms = next_hour_boundary_ms(now_ms)
         next_ms = next_bar_boundary_ms(now_ms)
         prep_wait = next_ms - PREP_MS - now_ms
         if prep_wait > 0:
@@ -546,7 +584,12 @@ def main():
         best = decisions[0]
         lotSz = info.get(best["instId"],{}).get("lotSz", Decimal("1"))
         ctVal = info.get(best["instId"],{}).get("ctVal", Decimal("1"))
-        sz_str = compute_size(best["px"], lotSz, ctVal, NOTIONAL_USDT)
+        equity = get_usdt_equity()
+        notional = (equity * TRADE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if notional < MIN_NOTIONAL:
+            _send_tg(f"[SKIP] Equity too low: eq={equity} USDT, notional={notional} < {MIN_NOTIONAL}")
+            continue
+        sz_str = compute_size(best["px"], lotSz, ctVal, notional)
         ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
         if not ok:
             _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
@@ -577,6 +620,10 @@ def main():
         qty_used = Decimal(str(min(float(entry_q or 0), float(exit_q or 0))))
         pnl = (Decimal(str(exit_px)) - Decimal(str(entry_px))) * sign * ctVal * qty_used
         _send_tg(f"[CLOSE] {best['instId']} {close_side.upper()} ordId={ordId2} px≈{exit_px}\nPnL≈ {pnl:.4f} USDT")
+        if pnl > 0:
+            hour_pnl_pos += pnl
+        elif pnl < 0:
+            hour_pnl_neg += pnl
 
 if __name__ == "__main__":
     main()
