@@ -1,0 +1,582 @@
+import os, json, time, hmac, base64, hashlib
+from decimal import Decimal, ROUND_DOWN, getcontext
+from datetime import datetime, timezone
+import requests
+import pandas as pd
+
+try:
+    import pandas_ta as ta
+    HAS_TA = True
+except Exception:
+    HAS_TA = False
+
+getcontext().prec = 34
+
+# ====== CONFIG ======
+BASE_URL = os.getenv("OKX_API_BASE", "https://www.okx.com")
+API_KEY = os.getenv("OKX_API_KEY") or "29809262-8962-4460-b7a0-280131629aea"
+API_SECRET = os.getenv("OKX_API_SECRET") or os.getenv("OKX_SECRET_KEY") or "1EBB409F0B37C9CB936FD6BD510A6C00"
+API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE") or os.getenv("OKX_PASSPHRASE") or "Q@BWaG2bf5ybmGZ"
+DEMO = os.getenv("DEMO", "1")
+HEDGE_MODE = os.getenv("HEDGE_MODE", "0") == "1"
+
+BAR_SECONDS = 900
+BAR_STR = "15m"
+PREP_MS = 1200
+BUSY_WAIT_MS = 50
+CLOSE_EARLY_MS = 5000
+TOP_N = 10
+NOTIONAL_USDT = Decimal(os.getenv("NOTIONAL_USDT", "90"))
+CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "65"))
+
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8367220857:AAHgvPb1pmAqHSwgixb9jBYCT2TTRrDnNL0"
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "1266351161"
+
+# ====== HELPERS ======
+def _now_ts():
+    return datetime.utcnow().replace(tzinfo=timezone.utc)
+
+def _ts_str(ms=False):
+    if ms:
+        return _now_ts().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return _now_ts().isoformat().replace("+00:00", "Z")
+
+def _send_tg(text: str):
+    print(text)
+    if TG_TOKEN and TG_CHAT_ID:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
+        except Exception as e:
+            print(f"[WARN] Telegram send failed: {e}")
+
+def _headers(method: str, request_path: str, body_str: str = "", query_str: str = None):
+    ts = _ts_str(ms=True)
+    path_for_sign = request_path
+    if method == "GET" and query_str:
+        path_for_sign += "?" + query_str
+    prehash = f"{ts}{method}{path_for_sign}{body_str}"
+    sign = base64.b64encode(hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
+    h = {
+        "OK-ACCESS-KEY": API_KEY,
+        "OK-ACCESS-SIGN": sign,
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": API_PASSPHRASE,
+        "Content-Type": "application/json",
+    }
+    if str(DEMO) == "1":
+        h["x-simulated-trading"] = "1"
+    return h
+
+def _req(method: str, path: str, params: dict = None):
+    url = BASE_URL + path
+    query = None
+    body = ""
+    if method == "GET":
+        if params:
+            query = "&".join([f"{k}={v}" for k, v in params.items()])
+            url += "?" + query
+        hdrs = _headers(method, path, "", query)
+        r = requests.get(url, headers=hdrs, timeout=15)
+    else:
+        body = json.dumps(params or {})
+        hdrs = _headers(method, path, body)
+        r = requests.post(url, headers=hdrs, data=body, timeout=15)
+    try:
+        return r.json()
+    except Exception:
+        return {"code": "HTTP", "msg": r.text, "status": r.status_code}
+
+def _to_df(candles):
+    if not candles:
+        return None
+    cols = ["ts","o","h","l","c","vol","volCcy","volCcyQuote","confirm"][:len(candles[0])]
+    df = pd.DataFrame(candles, columns=cols)
+    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    for c in ["o","h","l","c","vol"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","vol":"Volume"}, inplace=True)
+    df.sort_values("ts", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+def server_time_ms():
+    try:
+        r = _req("GET", "/api/v5/public/time")
+        return int(r.get("data", [{}])[0].get("ts", 0))
+    except Exception:
+        return int(time.time() * 1000)
+
+def next_bar_boundary_ms(ms=None):
+    ms = server_time_ms() if ms is None else ms
+    period = BAR_SECONDS * 1000
+    return ((ms // period) + 1) * period
+
+def wait_until(target_ms, busy_ms=BUSY_WAIT_MS):
+    while True:
+        now = server_time_ms()
+        remain = target_ms - now
+        if remain <= 0:
+            break
+        if remain > busy_ms:
+            time.sleep((remain - busy_ms) / 1000)
+        else:
+            time.sleep(remain / 1000)
+
+# ====== OKX API WRAPPERS ======
+def get_top_swaps(n=TOP_N):
+    res = _req("GET", "/api/v5/market/tickers", {"instType":"SWAP"})
+    arr = res.get("data", []) if isinstance(res, dict) else []
+    arr.sort(key=lambda x: float(x.get("volCcy24h","0") or 0), reverse=True)
+    return [x["instId"] for x in arr if x.get("instId","").endswith("-SWAP")][:n]
+
+def get_instruments_map():
+    res = _req("GET", "/api/v5/public/instruments", {"instType":"SWAP"})
+    mp = {}
+    for it in res.get("data", []):
+        mp[it["instId"]] = {
+            "lotSz": Decimal(str(it.get("lotSz") or it.get("minSz") or "1")),
+            "ctVal": Decimal(str(it.get("ctVal") or "1")),
+            "ctValCcy": it.get("ctValCcy", "")
+        }
+    return mp
+
+def get_candles(instId, limit=300):
+    res = _req("GET", "/api/v5/market/candles", {"instId":instId, "bar":BAR_STR, "limit":limit})
+    return res.get("data", [])
+
+def place_order(instId, side, sz, reduceOnly=False, tdMode="cross"):
+    body = {
+        "instId": instId,
+        "tdMode": tdMode,
+        "side": side,
+        "ordType": "market",
+        "sz": str(sz)
+    }
+    if reduceOnly:
+        body["reduceOnly"] = "true"
+    if HEDGE_MODE:
+        body["posSide"] = "long" if side=="buy" else "short"
+    res = _req("POST", "/api/v5/trade/order", body)
+    code = res.get("code")
+    data = res.get("data", [{}])[0]
+    ok = (code=="0" and str(data.get("sCode","0")) in ("0",""))
+    ordId = data.get("ordId")
+    return ok, ordId, res
+
+def get_fills(ordId=None, instId=None, limit=100):
+    params = {}
+    if ordId: params["ordId"] = ordId
+    if instId: params["instId"] = instId
+    params["limit"] = limit
+    res = _req("GET", "/api/v5/trade/fills", params)
+    return res.get("data", [])
+
+# ====== INDICATORS ======
+def indicators(df, idx):
+    o,h,l,c = df["Open"], df["High"], df["Low"], df["Close"]
+    v = df.get("Volume")
+    votes = []
+
+    ema9 = c.ewm(span=9, adjust=False).mean()
+    ema21 = c.ewm(span=21, adjust=False).mean()
+    votes.append(1 if ema9.iloc[idx] > ema21.iloc[idx] else -1)
+
+    sma20 = c.rolling(20).mean(); sma50 = c.rolling(50).mean()
+    votes.append(0 if (pd.isna(sma20.iloc[idx]) or pd.isna(sma50.iloc[idx])) else (1 if sma20.iloc[idx] > sma50.iloc[idx] else -1))
+
+    try:
+        rsi = ta.rsi(c, length=14) if HAS_TA else None
+    except Exception:
+        rsi = None
+    if rsi is None:
+        d = c.diff(); up = d.clip(lower=0).rolling(14).mean(); dn = -d.clip(upper=0).rolling(14).mean()
+        rs = up / (dn + 1e-9); rsi = 100 - (100/(1+rs))
+    rv = rsi.iloc[idx]
+    votes.append(1 if rv>55 else (-1 if rv<45 else 0))
+
+    if HAS_TA:
+        try:
+            st = ta.stoch(h,l,c,k=14,d=3)
+            k = st.iloc[:,0]; d_ = st.iloc[:,1]
+            votes.append(1 if (k.iloc[idx] > d_.iloc[idx] and k.iloc[idx] < 80) else (-1 if (k.iloc[idx] < d_.iloc[idx] and k.iloc[idx] > 20) else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        ll = l.rolling(14).min(); hh = h.rolling(14).max()
+        k = 100*(c-ll)/(hh-ll+1e-9); d_ = k.rolling(3).mean()
+        votes.append(1 if (k.iloc[idx] > d_.iloc[idx] and k.iloc[idx] < 80) else (-1 if (k.iloc[idx] < d_.iloc[idx] and k.iloc[idx] > 20) else 0))
+
+    if HAS_TA:
+        try:
+            mac = ta.macd(c); ml = mac.iloc[:,0]; sg = mac.iloc[:,2]
+            votes.append(1 if ml.iloc[idx] > sg.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        ema12 = c.ewm(span=12, adjust=False).mean(); ema26 = c.ewm(span=26, adjust=False).mean()
+        ml = ema12 - ema26; sg = ml.ewm(span=9, adjust=False).mean()
+        votes.append(1 if ml.iloc[idx] > sg.iloc[idx] else -1)
+
+    basis = c.rolling(20).mean()
+    votes.append(1 if c.iloc[idx] > basis.iloc[idx] else -1)
+
+    if HAS_TA:
+        try:
+            adx = ta.adx(h,l,c,length=14)
+            plusd, minusd, ax = adx["DMP_14"], adx["DMN_14"], adx["ADX_14"]
+            votes.append(0 if ax.iloc[idx] < 20 else (1 if plusd.iloc[idx] > minusd.iloc[idx] else -1))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            cci = ta.cci(h,l,c,length=20).iloc[idx]
+            votes.append(1 if cci>0 else (-1 if cci<0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    ha_c = (o+h+l+c)/4.0
+    ha_o = ha_c.copy()
+    for j in range(1, len(df)):
+        ha_o.iloc[j] = (ha_o.iloc[j-1] + ha_c.iloc[j-1]) / 2.0
+    votes.append(1 if ha_c.iloc[idx] > ha_o.iloc[idx] else -1)
+
+    conv = (h.rolling(9).max()+l.rolling(9).min())/2.0
+    base = (h.rolling(26).max()+l.rolling(26).min())/2.0
+    span_a = ((conv+base)/2.0).shift(26)
+    span_b = ((h.rolling(52).max()+l.rolling(52).min())/2.0).shift(26)
+    top = pd.concat([span_a, span_b], axis=1).max(axis=1)
+    bot = pd.concat([span_a, span_b], axis=1).min(axis=1)
+    if pd.isna(top.iloc[idx]) or pd.isna(bot.iloc[idx]):
+        votes.append(0)
+    else:
+        votes.append(1 if c.iloc[idx] > top.iloc[idx] else (-1 if c.iloc[idx] < bot.iloc[idx] else 0))
+
+    if HAS_TA:
+        try:
+            st = ta.supertrend(h,l,c,length=10,multiplier=3.0)
+            dcol = [x for x in st.columns if x.startswith("SUPERTd_")]
+            votes.append(1 if st[dcol[0]].iloc[idx] > 0 else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            kc = ta.kc(h,l,c,length=20); mid = kc.iloc[:,1]
+            votes.append(1 if c.iloc[idx] > mid.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            wr = ta.willr(h,l,c,length=14).iloc[idx]
+            votes.append(1 if wr > -50 else (-1 if wr < -50 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA and v is not None:
+        try:
+            mfi = ta.mfi(h,l,c,v,length=14).iloc[idx]
+            votes.append(1 if mfi > 50 else (-1 if mfi < 50 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            rv = ta.roc(c,length=9).iloc[idx]
+            votes.append(1 if rv > 0 else (-1 if rv < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            ar = ta.aroon(h,l,length=14); up = ar.iloc[:,0]; dn = ar.iloc[:,1]
+            votes.append(1 if up.iloc[idx] > dn.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            tv = ta.tsi(c).iloc[idx]
+            votes.append(1 if tv > 0 else (-1 if tv < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA and v is not None:
+        try:
+            dv = ta.obv(c, v).diff().iloc[idx]
+            votes.append(1 if dv > 0 else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            hma = ta.hma(c,length=55)
+            votes.append(1 if hma.iloc[idx] > hma.shift(1).iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    if HAS_TA:
+        try:
+            ps = ta.psar(h,l,c)
+            pcol = [x for x in ps.columns if x.startswith("PSAR")]
+            pv = ps[pcol[0]].iloc[idx]
+            votes.append(1 if c.iloc[idx] > pv else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 21) EMA 50/200 cross
+    ema50 = c.ewm(span=50, adjust=False).mean()
+    ema200 = c.ewm(span=200, adjust=False).mean()
+    votes.append(1 if ema50.iloc[idx] > ema200.iloc[idx] else -1)
+
+    # 22) SMA100 slope
+    sma100 = c.rolling(100).mean()
+    if pd.isna(sma100.iloc[idx]) or pd.isna(sma100.shift(1).iloc[idx]):
+        votes.append(0)
+    else:
+        votes.append(1 if sma100.iloc[idx] > sma100.shift(1).iloc[idx] else -1)
+
+    # 23) VWAP session
+    if HAS_TA and v is not None:
+        try:
+            vwap = ta.vwap(h,l,c,v).iloc[idx]
+            votes.append(1 if c.iloc[idx] > vwap else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 24) Donchian(20) mid
+    try:
+        upper = h.rolling(20).max(); lower = l.rolling(20).min(); mid = (upper+lower)/2
+        if pd.isna(mid.iloc[idx]):
+            votes.append(0)
+        else:
+            votes.append(1 if c.iloc[idx] > mid.iloc[idx] else -1)
+    except Exception:
+        votes.append(0)
+
+    # 25) KAMA(10) slope
+    if HAS_TA:
+        try:
+            kama = ta.kama(c,length=10)
+            if pd.isna(kama.iloc[idx]) or pd.isna(kama.shift(1).iloc[idx]):
+                votes.append(0)
+            else:
+                votes.append(1 if kama.iloc[idx] > kama.shift(1).iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 26) PPO(12,26,9)
+    if HAS_TA:
+        try:
+            ppo = ta.ppo(c)
+            line = ppo.iloc[:,0]; sig = ppo.iloc[:,1]
+            votes.append(1 if line.iloc[idx] > sig.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 27) Ultimate Oscillator
+    if HAS_TA:
+        try:
+            uo = ta.uo(h,l,c).iloc[idx]
+            votes.append(1 if uo > 50 else (-1 if uo < 50 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 28) Chaikin Money Flow
+    if HAS_TA and v is not None:
+        try:
+            cmf = ta.cmf(h,l,c,v,length=20).iloc[idx]
+            votes.append(1 if cmf > 0 else (-1 if cmf < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 29) Vortex(14)
+    if HAS_TA:
+        try:
+            vx = ta.vortex(h,l,c,length=14)
+            vplus = vx.iloc[:,0]; vminus = vx.iloc[:,1]
+            if pd.isna(vplus.iloc[idx]) or pd.isna(vminus.iloc[idx]):
+                votes.append(0)
+            else:
+                votes.append(1 if vplus.iloc[idx] > vminus.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 30) TRIX(30)
+    if HAS_TA:
+        try:
+            tr = ta.trix(c,length=30).iloc[idx]
+            votes.append(1 if tr > 0 else (-1 if tr < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    return votes
+
+def decide(instId):
+    df = _to_df(get_candles(instId, 300))
+    if df is None or len(df) < 100:
+        return None
+    idx = -2 if len(df) >= 2 else -1
+    votes = indicators(df, idx)
+    bulls = votes.count(1)
+    bears = votes.count(-1)
+    eff = bulls + bears
+    bull_pct = 100.0 * bulls/eff if eff>0 else 50.0
+    bear_pct = 100.0 - bull_pct
+    side = "buy" if bull_pct >= bear_pct else "sell"
+    score = bull_pct if side=="buy" else bear_pct
+    last_close = float(df["Close"].iloc[idx])
+    return {
+        "instId": instId,
+        "bull": bull_pct,
+        "bear": bear_pct,
+        "side": side,
+        "score": score,
+        "px": last_close
+    }
+
+def quantize_to_step(value: Decimal, step: Decimal) -> Decimal:
+    steps = (value / step).to_integral_value(rounding=ROUND_DOWN)
+    q = (steps * step).normalize()
+    if q <= Decimal("0"):
+        q = step
+    return q
+
+def compute_size(px_float: float, lotSz: Decimal, ctVal: Decimal, notional: Decimal) -> str:
+    px = Decimal(str(px_float))
+    raw = notional / (px * (ctVal if ctVal > 0 else Decimal("1e-9")))
+    q = quantize_to_step(raw, lotSz)
+    lot_decimals = max(0, -lotSz.as_tuple().exponent)
+    return f"{q:.{lot_decimals}f}"
+
+def avg_fill_price_and_qty(ordId):
+    fills = get_fills(ordId=ordId)
+    if not fills:
+        return None, None
+    total_q = Decimal("0")
+    total_notional = Decimal("0")
+    for f in fills:
+        try:
+            px = Decimal(str(f.get("px","0")))
+            sz = Decimal(str(f.get("sz","0")))
+            total_q += sz
+            total_notional += (px * sz)
+        except Exception:
+            continue
+    if total_q == 0:
+        return None, None
+    avg_px = (total_notional / total_q)
+    return float(avg_px), float(total_q)
+
+# ====== MAIN LOOP ======
+def main():
+    if not (API_KEY and API_SECRET and API_PASSPHRASE):
+        print("[ERR] Set API credentials"); return
+    info = get_instruments_map()
+    while True:
+        now_ms = server_time_ms()
+        next_ms = next_bar_boundary_ms(now_ms)
+        prep_wait = next_ms - PREP_MS - now_ms
+        if prep_wait > 0:
+            time.sleep(prep_wait/1000)
+        ids = get_top_swaps(TOP_N)
+        decisions = []
+        for instId in ids:
+            try:
+                d = decide(instId)
+                if d:
+                    decisions.append(d)
+            except Exception:
+                continue
+        decisions.sort(key=lambda x: x["score"], reverse=True)
+        boundary_time = datetime.fromtimestamp(next_ms/1000, tz=timezone.utc).isoformat()
+        if decisions:
+            lines = []
+            for idx, d in enumerate(decisions,1):
+                dir_ar = "شراء" if d['side']=="buy" else "بيع"
+                lines.append(f"{idx}) {d['instId']}: Bull {d['bull']:.1f}% | Bear {d['bear']:.1f}% ⇒ {dir_ar} (score {d['score']:.1f}%)")
+            _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\n" + "\n".join(lines))
+        else:
+            _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\nلا بيانات")
+        wait_until(next_ms, BUSY_WAIT_MS)
+        if not decisions or decisions[0]['score'] < CONSENSUS_THRESHOLD:
+            continue
+        best = decisions[0]
+        lotSz = info.get(best["instId"],{}).get("lotSz", Decimal("1"))
+        ctVal = info.get(best["instId"],{}).get("ctVal", Decimal("1"))
+        sz_str = compute_size(best["px"], lotSz, ctVal, NOTIONAL_USDT)
+        ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
+        if not ok:
+            _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
+            continue
+        entry_px, entry_q = avg_fill_price_and_qty(ordId)
+        if entry_px is None:
+            entry_px = best['px']
+        if entry_q is None:
+            try: entry_q = Decimal(sz_str)
+            except: entry_q = Decimal("0")
+        _send_tg(f"[OPEN] {best['instId']} {best['side'].upper()} ordId={ordId} sz={sz_str} px≈{entry_px} score={best['score']:.1f}%")
+        open_ms = next_ms
+        close_ms = open_ms + BAR_SECONDS*1000 - CLOSE_EARLY_MS
+        wait_until(close_ms, BUSY_WAIT_MS)
+        close_side = "sell" if best["side"]=="buy" else "buy"
+        ok2, ordId2, resp2 = place_order(best["instId"], close_side, sz_str, reduceOnly=True)
+        if not ok2:
+            _send_tg(f"[CLOSE-FAILED] {best['instId']} resp={resp2}")
+            continue
+        exit_px, exit_q = avg_fill_price_and_qty(ordId2)
+        if exit_px is None:
+            d2 = decide(best['instId'])
+            exit_px = d2['px'] if d2 else entry_px
+        if exit_q is None:
+            try: exit_q = Decimal(sz_str)
+            except: exit_q = Decimal("0")
+        sign = Decimal("1") if best['side']=="buy" else Decimal("-1")
+        qty_used = Decimal(str(min(float(entry_q or 0), float(exit_q or 0))))
+        pnl = (Decimal(str(exit_px)) - Decimal(str(entry_px))) * sign * ctVal * qty_used
+        _send_tg(f"[CLOSE] {best['instId']} {close_side.upper()} ordId={ordId2} px≈{exit_px}\nPnL≈ {pnl:.4f} USDT")
+
+if __name__ == "__main__":
+    main()
