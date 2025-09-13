@@ -1,8 +1,9 @@
-import os, json, time, hmac, base64, hashlib
+import os, json, time, hmac, base64, hashlib, re
 from decimal import Decimal, ROUND_DOWN, getcontext
 from datetime import datetime, timezone, UTC
 import requests
 import pandas as pd
+import numpy as np
 
 try:
     import pandas_ta as ta
@@ -228,10 +229,42 @@ def set_leverage_safely(instId, lever, mgnMode="cross"):
         return res
     return res
 
+
+def money_flow_index_series(h, l, c, v, length=14):
+    h = h.astype("float64"); l = l.astype("float64"); c = c.astype("float64"); v = v.astype("float64")
+    tp = (h + l + c) / 3.0
+    rmf = tp * v
+    up = tp > tp.shift(1)
+    dn = tp < tp.shift(1)
+    pos = rmf.where(up, 0.0).rolling(length).sum()
+    neg = rmf.where(dn, 0.0).rolling(length).sum()
+    mfr = pos / (neg + 1e-12)
+    return 100.0 - (100.0 / (1.0 + mfr))
+
+
+def session_vwap_series(df):
+    vol = df["Volume"].astype("float64")
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    tpv = tp * vol
+    dates = df.index.tz_convert("UTC").date
+    cum_tpv = tpv.groupby(dates).cumsum()
+    cum_v = vol.groupby(dates).cumsum()
+    return cum_tpv / (cum_v + 1e-12)
+
+
+def _parse_max_contracts_51004(msg: str) -> int | None:
+    m = re.search(r"more than\s+([\d,]+)\(contracts\)", msg or "", flags=re.I)
+    return int(m.group(1).replace(",", "")) if m else None
+
 # ====== INDICATORS ======
 def indicators(df, idx):
-    o,h,l,c = df["Open"], df["High"], df["Low"], df["Close"]
+    o = df["Open"].astype("float64")
+    h = df["High"].astype("float64")
+    l = df["Low"].astype("float64")
+    c = df["Close"].astype("float64")
     v = df.get("Volume")
+    if v is not None:
+        v = v.astype("float64")
     votes = []
 
     ema9 = c.ewm(span=9, adjust=False).mean()
@@ -341,10 +374,10 @@ def indicators(df, idx):
     else:
         votes.append(0)
 
-    if HAS_TA and v is not None:
+    if v is not None:
         try:
-            mfi = ta.mfi(h,l,c,v,length=14).iloc[idx]
-            votes.append(1 if mfi > 50 else (-1 if mfi < 50 else 0))
+            mfi_val = float(money_flow_index_series(h, l, c, v, 14).iloc[idx])
+            votes.append(1 if mfi_val > 50 else (-1 if mfi_val < 50 else 0))
         except Exception:
             votes.append(0)
     else:
@@ -419,9 +452,9 @@ def indicators(df, idx):
         votes.append(1 if sma100.iloc[idx] > sma100.shift(1).iloc[idx] else -1)
 
     # 23) VWAP session
-    if HAS_TA and v is not None:
+    if v is not None:
         try:
-            vwap = ta.vwap(h,l,c,v).iloc[idx]
+            vwap = float(session_vwap_series(df).iloc[idx])
             votes.append(1 if c.iloc[idx] > vwap else -1)
         except Exception:
             votes.append(0)
@@ -646,24 +679,32 @@ def main():
         set_leverage_safely(best["instId"], lever_int, "cross")
         ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
         data = resp.get("data", [{}])[0]
-        if not ok and str(data.get("sCode")) == "51008":
-            cur_size = Decimal(sz_str)
-            for _ in range(RETRIES_51008):
-                new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
-                new_size = clamp_order_size(inst_info, new_size)
-                if new_size <= 0:
-                    break
-                old_str = f"{cur_size:.{lot_decimals}f}"
-                new_str = f"{new_size:.{lot_decimals}f}"
-                _send_tg(f"[RETRY-51008] {best['instId']} size={old_str} -> {new_str}")
-                set_leverage_safely(best["instId"], lever_int, "cross")
-                ok, ordId, resp = place_order(best["instId"], best["side"], new_str, reduceOnly=False)
-                cur_size = new_size
-                sz_str = new_str
-                if ok:
-                    break
-                time.sleep(0.15)
-            data = resp.get("data", [{}])[0]
+        if not ok:
+            s_code = str(data.get("sCode"))
+            s_msg = data.get("sMsg", "")
+            hard_cap = _parse_max_contracts_51004(s_msg) if s_code == "51004" else None
+            if s_code in ("51008", "51004"):
+                cur_size = Decimal(sz_str)
+                if hard_cap is not None:
+                    cur_size = min(cur_size, Decimal(str(hard_cap)))
+                for _ in range(RETRIES_51008):
+                    new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                    new_size = clamp_order_size(inst_info, new_size)
+                    if hard_cap is not None:
+                        new_size = min(new_size, Decimal(str(hard_cap)))
+                    if new_size <= 0:
+                        break
+                    old_str = f"{cur_size:.{lot_decimals}f}"
+                    new_str = f"{new_size:.{lot_decimals}f}"
+                    _send_tg(f"[RETRY-{s_code}] {best['instId']} size={old_str} -> {new_str}")
+                    set_leverage_safely(best["instId"], lever_int, "cross")
+                    ok, ordId, resp = place_order(best["instId"], best["side"], new_str, reduceOnly=False)
+                    cur_size = new_size
+                    sz_str = new_str
+                    if ok:
+                        break
+                    time.sleep(0.15)
+                data = resp.get("data", [{}])[0]
         if not ok:
             _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
             continue
@@ -680,24 +721,32 @@ def main():
         close_side = "sell" if best["side"]=="buy" else "buy"
         ok2, ordId2, resp2 = place_order(best["instId"], close_side, sz_str, reduceOnly=True)
         data2 = resp2.get("data", [{}])[0]
-        if not ok2 and str(data2.get("sCode")) == "51008":
-            cur_size = Decimal(sz_str)
-            for _ in range(RETRIES_51008):
-                new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
-                new_size = clamp_order_size(inst_info, new_size)
-                if new_size <= 0:
-                    break
-                old_str = f"{cur_size:.{lot_decimals}f}"
-                new_str = f"{new_size:.{lot_decimals}f}"
-                _send_tg(f"[RETRY-51008] {best['instId']} size={old_str} -> {new_str}")
-                set_leverage_safely(best["instId"], lever_int, "cross")
-                ok2, ordId2, resp2 = place_order(best["instId"], close_side, new_str, reduceOnly=True)
-                cur_size = new_size
-                sz_str = new_str
-                if ok2:
-                    break
-                time.sleep(0.15)
-            data2 = resp2.get("data", [{}])[0]
+        if not ok2:
+            s_code2 = str(data2.get("sCode"))
+            s_msg2 = data2.get("sMsg", "")
+            hard_cap = _parse_max_contracts_51004(s_msg2) if s_code2 == "51004" else None
+            if s_code2 in ("51008", "51004"):
+                cur_size = Decimal(sz_str)
+                if hard_cap is not None:
+                    cur_size = min(cur_size, Decimal(str(hard_cap)))
+                for _ in range(RETRIES_51008):
+                    new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                    new_size = clamp_order_size(inst_info, new_size)
+                    if hard_cap is not None:
+                        new_size = min(new_size, Decimal(str(hard_cap)))
+                    if new_size <= 0:
+                        break
+                    old_str = f"{cur_size:.{lot_decimals}f}"
+                    new_str = f"{new_size:.{lot_decimals}f}"
+                    _send_tg(f"[RETRY-{s_code2}] {best['instId']} size={old_str} -> {new_str}")
+                    set_leverage_safely(best["instId"], lever_int, "cross")
+                    ok2, ordId2, resp2 = place_order(best["instId"], close_side, new_str, reduceOnly=True)
+                    cur_size = new_size
+                    sz_str = new_str
+                    if ok2:
+                        break
+                    time.sleep(0.15)
+                data2 = resp2.get("data", [{}])[0]
         if not ok2:
             _send_tg(f"[CLOSE-FAILED] {best['instId']} resp={resp2}")
             continue
