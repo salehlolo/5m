@@ -99,15 +99,35 @@ def _to_df(candles):
     df.reset_index(drop=True, inplace=True)
     return df
 
-def seconds_to_next_5m():
-    now = _now_ts()
-    minute_block = (now.minute // 5 + 1) * 5
-    target = now.replace(second=0, microsecond=0)
+def server_time_ms():
+    """Return OKX server time in milliseconds"""
+    try:
+        r = _req("GET", "/api/v5/public/time")
+        return int(r.get("data", [{}])[0].get("ts", 0))
+    except Exception:
+        return int(time.time() * 1000)
+
+def ms_to_next_5m(ms=None):
+    """Milliseconds until next 5m boundary using server time."""
+    if ms is None:
+        ms = server_time_ms()
+    dt = datetime.fromtimestamp(ms/1000, tz=timezone.utc)
+    minute_block = (dt.minute // 5 + 1) * 5
+    target = dt.replace(second=0, microsecond=0)
     if minute_block >= 60:
         target = target.replace(minute=0) + timedelta(hours=1)
     else:
         target = target.replace(minute=minute_block)
-    return max(0, int((target - now).total_seconds()))
+    return int((target - dt).total_seconds() * 1000)
+
+def wait_until(target_ms):
+    """Busy-wait until server time reaches target_ms"""
+    while True:
+        now = server_time_ms()
+        remain = target_ms - now
+        if remain <= 0:
+            break
+        time.sleep(min(0.5, remain/1000))
 
 # ====== OKX API WRAPPERS ======
 def get_top_swaps(n=TOP_N):
@@ -338,10 +358,6 @@ def compute_size(px_float: float, lotSz: Decimal, ctVal: Decimal, notional: Deci
     lot_decimals = max(0, -lotSz.as_tuple().exponent)
     return f"{q:.{lot_decimals}f}"
 
-def seconds_until_bar_end():
-    # After opening trade at bar start, wait till next 5m boundary to close
-    return seconds_to_next_5m()
-
 def avg_fill_price_and_qty(ordId):
     fills = get_fills(ordId=ordId)
     if not fills:
@@ -365,54 +381,53 @@ def main():
     if not (API_KEY and API_SECRET and API_PASSPHRASE):
         print("[ERR] Set API credentials"); return
 
-    ids = get_top_swaps(TOP_N)
     info = get_instruments_map()
-    print(f"[INIT] Top {len(ids)}: {', '.join(ids)}")
 
     while True:
-        # wait to new bar start
-        time.sleep(seconds_to_next_5m())
+        now_ms = server_time_ms()
+        wait_ms = ms_to_next_5m(now_ms)
+        target_ms = now_ms + wait_ms
+        if wait_ms > 800:
+            time.sleep((wait_ms - 800) / 1000)
 
-        # evaluate all and send TG summary
+        ids = get_top_swaps(TOP_N)
         decisions = []
-        lines = []
         for instId in ids:
             d = decide(instId)
             if d:
                 decisions.append(d)
-                lines.append(f"{instId}: Bull {d['bull']:.1f}% | Bear {d['bear']:.1f}% ⇒ {d['side'].upper()} (score {d['score']:.1f}%)")
+
+        decisions.sort(key=lambda x: x["score"], reverse=True)
         if decisions:
-            _send_tg("[5m SUMMARY]\\n" + "\\n".join(lines))
+            lines = [f"{d['instId']}: Bull {d['bull']:.1f}% | Bear {d['bear']:.1f}% ⇒ {d['side'].upper()} (score {d['score']:.1f}%)" for d in decisions]
+            _send_tg("[5m SUMMARY]\n" + "\n".join(lines))
         else:
-            _send_tg("[5m SUMMARY] No valid data."); 
+            _send_tg("[5m SUMMARY] No valid data.")
+            wait_until(target_ms)
             continue
 
-        # pick the highest consensus
-        best = max(decisions, key=lambda x: x["score"])
-
-        # compute order size (contracts) using lotSz & ctVal
+        best = decisions[0]
         lotSz = info.get(best["instId"],{}).get("lotSz", Decimal("1"))
         ctVal = info.get(best["instId"],{}).get("ctVal", Decimal("1"))
         sz_str = compute_size(best["px"], lotSz, ctVal, NOTIONAL_USDT)
 
+        wait_until(target_ms)
         ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
         if not ok:
             _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
             continue
 
-        # get entry fill price & qty
         entry_px, entry_q = avg_fill_price_and_qty(ordId)
         if entry_px is None:
-            entry_px = best["px"]  # fallback to last close
+            entry_px = best["px"]
         if entry_q is None:
             try: entry_q = Decimal(sz_str)
             except: entry_q = Decimal("0")
 
-        _send_tg(f"[OPEN] {best['instId']} {best['side'].upper()} ordId={ordId} sz={sz_str} px≈{entry_px}")
+        _send_tg(f"[OPEN] {best['instId']} {best['side'].upper()} ordId={ordId} sz={sz_str} px≈{entry_px} score={best['score']:.1f}%")
 
-        # wait till end of bar and close reduceOnly
-        time.sleep(seconds_until_bar_end() or 298)  # safety fallback
-
+        close_ms = target_ms + 5*60*1000
+        wait_until(close_ms)
         close_side = "sell" if best["side"]=="buy" else "buy"
         ok2, ordId2, resp2 = place_order(best["instId"], close_side, sz_str, reduceOnly=True)
         if not ok2:
@@ -421,21 +436,18 @@ def main():
 
         exit_px, exit_q = avg_fill_price_and_qty(ordId2)
         if exit_px is None:
-            # fetch latest candle close as fallback
             d2 = decide(best["instId"])
             exit_px = d2["px"] if d2 else entry_px
         if exit_q is None:
             try: exit_q = Decimal(sz_str)
             except: exit_q = Decimal("0")
 
-        # compute P&L in USDT (approx; fees excluded)
-        # Linear USDT-margined: PnL = (exit - entry) * sign * ctVal * qty
         sign = Decimal("1") if best["side"]=="buy" else Decimal("-1")
         qty_used = Decimal(str(min(float(entry_q), float(exit_q))))
         pnl = (Decimal(str(exit_px)) - Decimal(str(entry_px))) * sign * ctVal * qty_used
 
         result = "ربح ✅" if pnl > 0 else ("خسارة ❌" if pnl < 0 else "متعادل •")
-        _send_tg(f"[CLOSE] {best['instId']} {close_side.upper()} ordId={ordId2} px≈{exit_px}\\nالنتيجة: {result} | PnL≈ {pnl:.4f} USDT")
+        _send_tg(f"[CLOSE] {best['instId']} {close_side.upper()} ordId={ordId2} px≈{exit_px}\nالنتيجة: {result} | PnL≈ {pnl:.4f} USDT")
 
 if __name__ == "__main__":
     main()
