@@ -1,6 +1,6 @@
 import os, json, time, hmac, base64, hashlib
 from decimal import Decimal, ROUND_DOWN, getcontext
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import requests
 import pandas as pd
 
@@ -35,12 +35,15 @@ SAFETY = Decimal(os.getenv("SAFETY", "0.90"))            # هامش أمان إ�
 RETRIES_51008 = int(os.getenv("RETRIES_51008", "4"))
 SHRINK_FACTOR = Decimal(os.getenv("SHRINK_FACTOR", "0.85"))
 
+# cache for applied leverage per instrument
+_LEVER_CACHE = {}
+
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8367220857:AAHgvPb1pmAqHSwgixb9jBYCT2TTRrDnNL0"
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "1266351161"
 
 # ====== HELPERS ======
 def _now_ts():
-    return datetime.utcnow().replace(tzinfo=timezone.utc)
+    return datetime.now(UTC)
 
 def _ts_str(ms=False):
     if ms:
@@ -98,14 +101,13 @@ def _to_df(candles):
         return None
     cols = ["ts","o","h","l","c","vol","volCcy","volCcyQuote","confirm"][:len(candles[0])]
     df = pd.DataFrame(candles, columns=cols)
-    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df["ts"] = pd.to_datetime(pd.to_numeric(df["ts"], errors="coerce"), unit="ms", utc=True)
     for c in ["o","h","l","c","vol"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
     df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","vol":"Volume"}, inplace=True)
     df.sort_values("ts", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df.set_index("ts", drop=True, inplace=True)
     return df
 
 def server_time_ms():
@@ -150,13 +152,21 @@ def get_instruments_map():
         mp[it["instId"]] = {
             "lotSz": Decimal(str(it.get("lotSz") or it.get("minSz") or "1")),
             "ctVal": Decimal(str(it.get("ctVal") or "1")),
-            "ctValCcy": it.get("ctValCcy", "")
+            "ctValCcy": it.get("ctValCcy", ""),
+            "maxMktSz": Decimal(str(it.get("maxMktSz") or it.get("maxLmtSz") or "0"))
         }
     return mp
 
 def get_candles(instId, limit=300):
     res = _req("GET", "/api/v5/market/candles", {"instId":instId, "bar":BAR_STR, "limit":limit})
     return res.get("data", [])
+
+def get_ticker(instId):
+    res = _req("GET", "/api/v5/market/ticker", {"instId": instId})
+    try:
+        return float(res.get("data", [{}])[0].get("last"))
+    except Exception:
+        return None
 
 def place_order(instId, side, sz, reduceOnly=False, tdMode="cross"):
     body = {
@@ -202,11 +212,20 @@ def get_usdt_equity():
         return Decimal("0")
 
 
-def set_leverage(instId, lever, mgnMode="cross"):
+def set_leverage_safely(instId, lever, mgnMode="cross"):
+    if _LEVER_CACHE.get(instId) == lever:
+        return {"code": "0"}
     body = {"instId": instId, "lever": str(lever), "mgnMode": mgnMode}
-    res = _req("POST", "/api/v5/account/set-leverage", body)
-    if str(res.get("code")) != "0":
-        print(f"[WARN] set_leverage {instId} resp={res}")
+    for wait in (0.1, 0.2, 0.4, 0.8, 1.6):
+        res = _req("POST", "/api/v5/account/set-leverage", body)
+        code = str(res.get("code"))
+        if code == "0":
+            _LEVER_CACHE[instId] = lever
+            return res
+        if code == "50011":
+            time.sleep(wait)
+            continue
+        return res
     return res
 
 # ====== INDICATORS ======
@@ -517,6 +536,14 @@ def quantize_to_step(value: Decimal, step: Decimal) -> Decimal:
     q = (steps * step).normalize()
     return q
 
+def clamp_order_size(inst_info: dict, sz: Decimal) -> Decimal:
+    lot = inst_info.get("lotSz", Decimal("1"))
+    max_mkt = inst_info.get("maxMktSz", Decimal("0"))
+    if max_mkt > 0 and sz > max_mkt:
+        sz = max_mkt
+    sz = quantize_to_step(sz, lot)
+    return max(sz, Decimal("0"))
+
 def compute_size(px_float: float, lotSz: Decimal, ctVal: Decimal, notional: Decimal) -> str:
     px = Decimal(str(px_float))
     raw = notional / (px * (ctVal if ctVal > 0 else Decimal("1e-9")))
@@ -571,7 +598,7 @@ def main():
         lever_int = int(LEVERAGE)
         for instId in ids:
             try:
-                set_leverage(instId, lever_int, "cross")
+                set_leverage_safely(instId, lever_int, "cross")
             except Exception:
                 pass
         decisions = []
@@ -596,8 +623,11 @@ def main():
         if not decisions or decisions[0]['score'] < CONSENSUS_THRESHOLD:
             continue
         best = decisions[0]
-        lotSz = info.get(best["instId"],{}).get("lotSz", Decimal("1"))
-        ctVal = info.get(best["instId"],{}).get("ctVal", Decimal("1"))
+        inst_info = info.get(best["instId"], {})
+        lotSz = inst_info.get("lotSz", Decimal("1"))
+        ctVal = inst_info.get("ctVal", Decimal("1"))
+        max_mkt = inst_info.get("maxMktSz", Decimal("0"))
+        print(f"[INFO] {best['instId']} lotSz={lotSz} ctVal={ctVal} maxMktSz={max_mkt}")
         lot_decimals = max(0, -lotSz.as_tuple().exponent)
         equity = get_usdt_equity()
         notional_90 = (equity * TRADE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
@@ -606,28 +636,33 @@ def main():
         if final_notional <= Decimal("0.00"):
             _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
             continue
-        sz_str = compute_size(best["px"], lotSz, ctVal, final_notional)
-        if Decimal(sz_str) <= 0:
+        last_px = get_ticker(best["instId"]) or best["px"]
+        sz_str = compute_size(last_px, lotSz, ctVal, final_notional)
+        sz_dec = clamp_order_size(inst_info, Decimal(sz_str))
+        sz_str = f"{sz_dec:.{lot_decimals}f}"
+        if sz_dec <= 0:
             _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
             continue
-        set_leverage(best["instId"], lever_int, "cross")
+        set_leverage_safely(best["instId"], lever_int, "cross")
         ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
         data = resp.get("data", [{}])[0]
         if not ok and str(data.get("sCode")) == "51008":
             cur_size = Decimal(sz_str)
             for _ in range(RETRIES_51008):
                 new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                new_size = clamp_order_size(inst_info, new_size)
                 if new_size <= 0:
                     break
                 old_str = f"{cur_size:.{lot_decimals}f}"
                 new_str = f"{new_size:.{lot_decimals}f}"
                 _send_tg(f"[RETRY-51008] {best['instId']} size={old_str} -> {new_str}")
-                set_leverage(best["instId"], lever_int, "cross")
+                set_leverage_safely(best["instId"], lever_int, "cross")
                 ok, ordId, resp = place_order(best["instId"], best["side"], new_str, reduceOnly=False)
                 cur_size = new_size
                 sz_str = new_str
                 if ok:
                     break
+                time.sleep(0.15)
             data = resp.get("data", [{}])[0]
         if not ok:
             _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
@@ -649,17 +684,19 @@ def main():
             cur_size = Decimal(sz_str)
             for _ in range(RETRIES_51008):
                 new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                new_size = clamp_order_size(inst_info, new_size)
                 if new_size <= 0:
                     break
                 old_str = f"{cur_size:.{lot_decimals}f}"
                 new_str = f"{new_size:.{lot_decimals}f}"
                 _send_tg(f"[RETRY-51008] {best['instId']} size={old_str} -> {new_str}")
-                set_leverage(best["instId"], lever_int, "cross")
+                set_leverage_safely(best["instId"], lever_int, "cross")
                 ok2, ordId2, resp2 = place_order(best["instId"], close_side, new_str, reduceOnly=True)
                 cur_size = new_size
                 sz_str = new_str
                 if ok2:
                     break
+                time.sleep(0.15)
             data2 = resp2.get("data", [{}])[0]
         if not ok2:
             _send_tg(f"[CLOSE-FAILED] {best['instId']} resp={resp2}")
