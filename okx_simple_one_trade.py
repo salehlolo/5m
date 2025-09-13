@@ -24,7 +24,7 @@ HEDGE_MODE = os.getenv("HEDGE_MODE", "0") == "1"
 BAR_SECONDS = 900
 BAR_STR = "15m"
 PREP_MS = 1200
-BUSY_WAIT_MS = 50
+BUSY_WAIT_MS = int(os.getenv("BUSY_WAIT_MS", "50"))
 CLOSE_EARLY_MS = 5000
 TOP_N = 10
 CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "65"))
@@ -33,8 +33,8 @@ CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "65"))
 TRADE_PCT = Decimal(os.getenv("TRADE_PCT", "0.90"))      # 90% من الإكويتي
 LEVERAGE = Decimal(os.getenv("LEVERAGE", "10"))
 SAFETY = Decimal(os.getenv("SAFETY", "0.90"))            # هامش أمان إضافي
-RETRIES_51008 = int(os.getenv("RETRIES_51008", "4"))
-SHRINK_FACTOR = Decimal(os.getenv("SHRINK_FACTOR", "0.85"))
+RETRIES_51008 = int(os.getenv("RETRIES_51008", "2"))
+SHRINK_FACTOR = Decimal(os.getenv("SHRINK_FACTOR", "0.50"))
 
 # cache for applied leverage per instrument
 _LEVER_CACHE = {}
@@ -211,6 +211,20 @@ def get_usdt_equity():
         return max(eq, Decimal("0"))
     except Exception:
         return Decimal("0")
+
+
+def get_max_avail_size(instId: str, side: str, tdMode="cross"):
+    res = _req("GET", "/api/v5/account/max-avail-size", {"instId": instId, "tdMode": tdMode})
+    d = (res or {}).get("data", [{}])[0]
+    keys = ["availBuy", "maxBuy"] if side == "buy" else ["availSell", "maxSell"]
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", "0"):
+            try:
+                return Decimal(str(v))
+            except Exception:
+                pass
+    return None
 
 
 def set_leverage_safely(instId, lever, mgnMode="cross"):
@@ -652,30 +666,54 @@ def main():
             _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\n" + "\n".join(lines))
         else:
             _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\nلا بيانات")
+        trade = None
+        if decisions and decisions[0]['score'] >= CONSENSUS_THRESHOLD:
+            best = decisions[0]
+            inst_info = info.get(best["instId"], {})
+            lotSz = inst_info.get("lotSz", Decimal("1"))
+            ctVal = inst_info.get("ctVal", Decimal("1"))
+            max_mkt = inst_info.get("maxMktSz", Decimal("0"))
+            print(f"[INFO] {best['instId']} lotSz={lotSz} ctVal={ctVal} maxMktSz={max_mkt}")
+            lot_decimals = max(0, -lotSz.as_tuple().exponent)
+            equity = get_usdt_equity()
+            notional_90 = (equity * TRADE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            max_notional = (equity * LEVERAGE * SAFETY).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            final_notional = notional_90 if notional_90 < max_notional else max_notional
+            if final_notional <= Decimal("0.00"):
+                _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
+            else:
+                last_px = get_ticker(best["instId"]) or best["px"]
+                pre_sz_str = compute_size(last_px, lotSz, ctVal, final_notional)
+                pre_sz_dec = clamp_order_size(inst_info, Decimal(pre_sz_str))
+                if pre_sz_dec > 0:
+                    trade = {
+                        "best": best,
+                        "inst_info": inst_info,
+                        "lotSz": lotSz,
+                        "lot_decimals": lot_decimals,
+                        "ctVal": ctVal,
+                        "sz_dec": pre_sz_dec,
+                        "sz_str": f"{pre_sz_dec:.{lot_decimals}f}",
+                    }
+                else:
+                    _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
         wait_until(next_ms, BUSY_WAIT_MS)
-        if not decisions or decisions[0]['score'] < CONSENSUS_THRESHOLD:
+        if not trade:
             continue
-        best = decisions[0]
-        inst_info = info.get(best["instId"], {})
-        lotSz = inst_info.get("lotSz", Decimal("1"))
-        ctVal = inst_info.get("ctVal", Decimal("1"))
-        max_mkt = inst_info.get("maxMktSz", Decimal("0"))
-        print(f"[INFO] {best['instId']} lotSz={lotSz} ctVal={ctVal} maxMktSz={max_mkt}")
-        lot_decimals = max(0, -lotSz.as_tuple().exponent)
-        equity = get_usdt_equity()
-        notional_90 = (equity * TRADE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        max_notional = (equity * LEVERAGE * SAFETY).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        final_notional = notional_90 if notional_90 < max_notional else max_notional
-        if final_notional <= Decimal("0.00"):
-            _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
-            continue
-        last_px = get_ticker(best["instId"]) or best["px"]
-        sz_str = compute_size(last_px, lotSz, ctVal, final_notional)
-        sz_dec = clamp_order_size(inst_info, Decimal(sz_str))
-        sz_str = f"{sz_dec:.{lot_decimals}f}"
-        if sz_dec <= 0:
-            _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
-            continue
+        best = trade["best"]
+        inst_info = trade["inst_info"]
+        lotSz = trade["lotSz"]
+        lot_decimals = trade["lot_decimals"]
+        ctVal = trade["ctVal"]
+        sz_dec = trade["sz_dec"]
+        sz_str = trade["sz_str"]
+        max_avail = get_max_avail_size(best["instId"], best["side"], "cross")
+        if max_avail is not None:
+            sz_dec = clamp_order_size(inst_info, min(sz_dec, max_avail))
+            sz_str = f"{sz_dec:.{lot_decimals}f}"
+            if sz_dec <= 0:
+                _send_tg(f"[SKIP] max_avail too small")
+                continue
         set_leverage_safely(best["instId"], lever_int, "cross")
         ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
         data = resp.get("data", [{}])[0]
@@ -703,7 +741,6 @@ def main():
                     sz_str = new_str
                     if ok:
                         break
-                    time.sleep(0.15)
                 data = resp.get("data", [{}])[0]
         if not ok:
             _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
@@ -745,7 +782,6 @@ def main():
                     sz_str = new_str
                     if ok2:
                         break
-                    time.sleep(0.15)
                 data2 = resp2.get("data", [{}])[0]
         if not ok2:
             _send_tg(f"[CLOSE-FAILED] {best['instId']} resp={resp2}")
