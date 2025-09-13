@@ -26,12 +26,14 @@ PREP_MS = 1200
 BUSY_WAIT_MS = 50
 CLOSE_EARLY_MS = 5000
 TOP_N = 10
-NOTIONAL_USDT = Decimal(os.getenv("NOTIONAL_USDT", "90"))
 CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "65"))
 
-# نسبة من رأس المال للتداول (افتراضي 90%)
-TRADE_PCT = Decimal(os.getenv("TRADE_PCT", "0.90"))   # 0.90 = 90%
-MIN_NOTIONAL = Decimal(os.getenv("MIN_NOTIONAL", "10"))  # أقل قيمة اسمية نحاول بها (حماية)
+# إعدادات التداول والهوامش
+TRADE_PCT = Decimal(os.getenv("TRADE_PCT", "0.90"))      # 90% من الإكويتي
+LEVERAGE = Decimal(os.getenv("LEVERAGE", "20"))
+SAFETY = Decimal(os.getenv("SAFETY", "0.90"))            # هامش أمان إضافي
+RETRIES_51008 = int(os.getenv("RETRIES_51008", "4"))
+SHRINK_FACTOR = Decimal(os.getenv("SHRINK_FACTOR", "0.85"))
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8367220857:AAHgvPb1pmAqHSwgixb9jBYCT2TTRrDnNL0"
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "1266351161"
@@ -198,6 +200,14 @@ def get_usdt_equity():
         return max(eq, Decimal("0"))
     except Exception:
         return Decimal("0")
+
+
+def set_leverage(instId, lever, mgnMode="cross"):
+    body = {"instId": instId, "lever": str(lever), "mgnMode": mgnMode}
+    res = _req("POST", "/api/v5/account/set-leverage", body)
+    if str(res.get("code")) != "0":
+        print(f"[WARN] set_leverage {instId} resp={res}")
+    return res
 
 # ====== INDICATORS ======
 def indicators(df, idx):
@@ -505,8 +515,6 @@ def decide(instId):
 def quantize_to_step(value: Decimal, step: Decimal) -> Decimal:
     steps = (value / step).to_integral_value(rounding=ROUND_DOWN)
     q = (steps * step).normalize()
-    if q <= Decimal("0"):
-        q = step
     return q
 
 def compute_size(px_float: float, lotSz: Decimal, ctVal: Decimal, notional: Decimal) -> str:
@@ -560,6 +568,12 @@ def main():
         if prep_wait > 0:
             time.sleep(prep_wait/1000)
         ids = get_top_swaps(TOP_N)
+        lever_int = int(LEVERAGE)
+        for instId in ids:
+            try:
+                set_leverage(instId, lever_int, "cross")
+            except Exception:
+                pass
         decisions = []
         for instId in ids:
             try:
@@ -584,13 +598,37 @@ def main():
         best = decisions[0]
         lotSz = info.get(best["instId"],{}).get("lotSz", Decimal("1"))
         ctVal = info.get(best["instId"],{}).get("ctVal", Decimal("1"))
+        lot_decimals = max(0, -lotSz.as_tuple().exponent)
         equity = get_usdt_equity()
-        notional = (equity * TRADE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        if notional < MIN_NOTIONAL:
-            _send_tg(f"[SKIP] Equity too low: eq={equity} USDT, notional={notional} < {MIN_NOTIONAL}")
+        notional_90 = (equity * TRADE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        max_notional = (equity * LEVERAGE * SAFETY).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        final_notional = notional_90 if notional_90 < max_notional else max_notional
+        if final_notional <= Decimal("0.00"):
+            _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
             continue
-        sz_str = compute_size(best["px"], lotSz, ctVal, notional)
+        sz_str = compute_size(best["px"], lotSz, ctVal, final_notional)
+        if Decimal(sz_str) <= 0:
+            _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
+            continue
+        set_leverage(best["instId"], lever_int, "cross")
         ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
+        data = resp.get("data", [{}])[0]
+        if not ok and str(data.get("sCode")) == "51008":
+            cur_size = Decimal(sz_str)
+            for _ in range(RETRIES_51008):
+                new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                if new_size <= 0:
+                    break
+                old_str = f"{cur_size:.{lot_decimals}f}"
+                new_str = f"{new_size:.{lot_decimals}f}"
+                _send_tg(f"[RETRY-51008] {best['instId']} size={old_str} -> {new_str}")
+                set_leverage(best["instId"], lever_int, "cross")
+                ok, ordId, resp = place_order(best["instId"], best["side"], new_str, reduceOnly=False)
+                cur_size = new_size
+                sz_str = new_str
+                if ok:
+                    break
+            data = resp.get("data", [{}])[0]
         if not ok:
             _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
             continue
@@ -606,6 +644,23 @@ def main():
         wait_until(close_ms, BUSY_WAIT_MS)
         close_side = "sell" if best["side"]=="buy" else "buy"
         ok2, ordId2, resp2 = place_order(best["instId"], close_side, sz_str, reduceOnly=True)
+        data2 = resp2.get("data", [{}])[0]
+        if not ok2 and str(data2.get("sCode")) == "51008":
+            cur_size = Decimal(sz_str)
+            for _ in range(RETRIES_51008):
+                new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                if new_size <= 0:
+                    break
+                old_str = f"{cur_size:.{lot_decimals}f}"
+                new_str = f"{new_size:.{lot_decimals}f}"
+                _send_tg(f"[RETRY-51008] {best['instId']} size={old_str} -> {new_str}")
+                set_leverage(best["instId"], lever_int, "cross")
+                ok2, ordId2, resp2 = place_order(best["instId"], close_side, new_str, reduceOnly=True)
+                cur_size = new_size
+                sz_str = new_str
+                if ok2:
+                    break
+            data2 = resp2.get("data", [{}])[0]
         if not ok2:
             _send_tg(f"[CLOSE-FAILED] {best['instId']} resp={resp2}")
             continue
