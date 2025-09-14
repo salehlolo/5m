@@ -27,7 +27,7 @@ PREP_MS = 1200
 BUSY_WAIT_MS = int(os.getenv("BUSY_WAIT_MS", "50"))
 CLOSE_EARLY_MS = 5000
 TOP_N = 10
-CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "65"))
+CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "75"))
 
 # إعدادات التداول والهوامش
 TRADE_PCT = Decimal(os.getenv("TRADE_PCT", "0.90"))      # 90% من الإكويتي
@@ -158,9 +158,38 @@ def get_instruments_map():
         }
     return mp
 
-def get_candles(instId, limit=300):
-    res = _req("GET", "/api/v5/market/candles", {"instId":instId, "bar":BAR_STR, "limit":limit})
+def get_candles(instId, bar=BAR_STR, limit=300):
+    res = _req("GET", "/api/v5/market/candles", {"instId": instId, "bar": bar, "limit": limit})
     return res.get("data", [])
+
+def trend_ok_1h(instId: str, side: str, fast_len: int = 50, slow_len: int = 200) -> bool:
+    """
+    يسمح بالدخول لو الترند على إطار 1H موافق لاتجاه الصفقة:
+      - شراء: EMA50 > EMA200
+      - بيع : EMA50 < EMA200
+    بنستخدم آخر شمعة مُغلقة (iloc[-2]).
+    """
+    try:
+        candles = get_candles(instId, bar="1H", limit=max(fast_len, slow_len) + 250)
+        if not candles:
+            return False
+        df1h = _to_df(candles)
+        close = df1h["Close"]
+        if HAS_TA:
+            ema_fast = ta.ema(close, length=fast_len)
+            ema_slow = ta.ema(close, length=slow_len)
+        else:
+            ema_fast = close.ewm(span=fast_len, adjust=False).mean()
+            ema_slow = close.ewm(span=slow_len, adjust=False).mean()
+        e_fast = ema_fast.dropna().iloc[-2]
+        e_slow = ema_slow.dropna().iloc[-2]
+        if side.lower() in ("buy", "long", "شراء"):
+            return bool(e_fast > e_slow)
+        else:
+            return bool(e_fast < e_slow)
+    except Exception as e:
+        print(f"[WARN] trend_ok_1h failed for {instId}: {e}")
+        return False
 
 def get_ticker(instId):
     res = _req("GET", "/api/v5/market/ticker", {"instId": instId})
@@ -556,7 +585,7 @@ def indicators(df, idx):
     return votes
 
 def decide(instId):
-    df = _to_df(get_candles(instId, 300))
+    df = _to_df(get_candles(instId, limit=300))
     if df is None or len(df) < 100:
         return None
     idx = -2 if len(df) >= 2 else -1
@@ -569,6 +598,10 @@ def decide(instId):
     side = "buy" if bull_pct >= bear_pct else "sell"
     score = bull_pct if side=="buy" else bear_pct
     last_close = float(df["Close"].iloc[idx])
+    if score < CONSENSUS_THRESHOLD:
+        return None
+    if not trend_ok_1h(instId, side):
+        return None
     return {
         "instId": instId,
         "bull": bull_pct,
@@ -662,12 +695,12 @@ def main():
             lines = []
             for idx, d in enumerate(decisions,1):
                 dir_ar = "شراء" if d['side']=="buy" else "بيع"
-                lines.append(f"{idx}) {d['instId']}: Bull {d['bull']:.1f}% | Bear {d['bear']:.1f}% ⇒ {dir_ar} (score {d['score']:.1f}%)")
+                lines.append(f"{idx}) {d['instId']}: Bull {d['bull']:.1f}% | Bear {d['bear']:.1f}% ⇒ {dir_ar} (score {d['score']:.1f}%) [✓1H]")
             _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\n" + "\n".join(lines))
         else:
             _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\nلا بيانات")
         trade = None
-        if decisions and decisions[0]['score'] >= CONSENSUS_THRESHOLD:
+        if decisions:
             best = decisions[0]
             inst_info = info.get(best["instId"], {})
             lotSz = inst_info.get("lotSz", Decimal("1"))
