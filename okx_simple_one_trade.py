@@ -1,9 +1,9 @@
-
-import os, json, time, math, hmac, base64, hashlib
+import os, json, time, hmac, base64, hashlib, re
 from decimal import Decimal, ROUND_DOWN, getcontext
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, UTC
 import requests
 import pandas as pd
+import numpy as np
 
 try:
     import pandas_ta as ta
@@ -13,29 +13,43 @@ except Exception:
 
 getcontext().prec = 34
 
-# ====== CONFIG (env first, then fallback to your provided keys) ======
+# ====== CONFIG ======
 BASE_URL = os.getenv("OKX_API_BASE", "https://www.okx.com")
 API_KEY = os.getenv("OKX_API_KEY") or "29809262-8962-4460-b7a0-280131629aea"
 API_SECRET = os.getenv("OKX_API_SECRET") or os.getenv("OKX_SECRET_KEY") or "1EBB409F0B37C9CB936FD6BD510A6C00"
 API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE") or os.getenv("OKX_PASSPHRASE") or "Q@BWaG2bf5ybmGZ"
-DEMO = os.getenv("DEMO", "1")  # "1" for demo
+DEMO = os.getenv("DEMO", "1")
 HEDGE_MODE = os.getenv("HEDGE_MODE", "0") == "1"
 
-BAR = "5m"
+BAR_SECONDS = 900
+BAR_STR = "15m"
+PREP_MS = 1200
+BUSY_WAIT_MS = int(os.getenv("BUSY_WAIT_MS", "50"))
+CLOSE_EARLY_MS = 5000
 TOP_N = 10
-NOTIONAL_USDT = Decimal(os.getenv("NOTIONAL_USDT", "90"))  # $90 fixed per trade
+CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS", "75"))
+
+# إعدادات التداول والهوامش
+TRADE_PCT = Decimal(os.getenv("TRADE_PCT", "0.90"))      # 90% من الإكويتي
+LEVERAGE = Decimal(os.getenv("LEVERAGE", "10"))
+SAFETY = Decimal(os.getenv("SAFETY", "0.90"))            # هامش أمان إضافي
+RETRIES_51008 = int(os.getenv("RETRIES_51008", "2"))
+SHRINK_FACTOR = Decimal(os.getenv("SHRINK_FACTOR", "0.50"))
+
+# cache for applied leverage per instrument
+_LEVER_CACHE = {}
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8367220857:AAHgvPb1pmAqHSwgixb9jBYCT2TTRrDnNL0"
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "1266351161"
 
 # ====== HELPERS ======
 def _now_ts():
-    return datetime.utcnow().replace(tzinfo=timezone.utc)
+    return datetime.now(UTC)
 
 def _ts_str(ms=False):
     if ms:
-        return _now_ts().isoformat(timespec="milliseconds").replace("+00:00","Z")
-    return _now_ts().isoformat().replace("+00:00","Z")
+        return _now_ts().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return _now_ts().isoformat().replace("+00:00", "Z")
 
 def _send_tg(text: str):
     print(text)
@@ -47,7 +61,6 @@ def _send_tg(text: str):
             print(f"[WARN] Telegram send failed: {e}")
 
 def _headers(method: str, request_path: str, body_str: str = "", query_str: str = None):
-    # Use ONE timestamp for both header and signing
     ts = _ts_str(ms=True)
     path_for_sign = request_path
     if method == "GET" and query_str:
@@ -89,25 +102,42 @@ def _to_df(candles):
         return None
     cols = ["ts","o","h","l","c","vol","volCcy","volCcyQuote","confirm"][:len(candles[0])]
     df = pd.DataFrame(candles, columns=cols)
-    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df["ts"] = pd.to_datetime(pd.to_numeric(df["ts"], errors="coerce"), unit="ms", utc=True)
     for c in ["o","h","l","c","vol"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
     df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","vol":"Volume"}, inplace=True)
     df.sort_values("ts", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df.set_index("ts", drop=True, inplace=True)
     return df
 
-def seconds_to_next_5m():
-    now = _now_ts()
-    minute_block = (now.minute // 5 + 1) * 5
-    target = now.replace(second=0, microsecond=0)
-    if minute_block >= 60:
-        target = target.replace(minute=0) + timedelta(hours=1)
-    else:
-        target = target.replace(minute=minute_block)
-    return max(0, int((target - now).total_seconds()))
+def server_time_ms():
+    try:
+        r = _req("GET", "/api/v5/public/time")
+        return int(r.get("data", [{}])[0].get("ts", 0))
+    except Exception:
+        return int(time.time() * 1000)
+
+def next_bar_boundary_ms(ms=None):
+    ms = server_time_ms() if ms is None else ms
+    period = BAR_SECONDS * 1000
+    return ((ms // period) + 1) * period
+
+def next_hour_boundary_ms(ms=None):
+    ms = server_time_ms() if ms is None else ms
+    H = 3600 * 1000
+    return ((ms // H) + 1) * H
+
+def wait_until(target_ms, busy_ms=BUSY_WAIT_MS):
+    while True:
+        now = server_time_ms()
+        remain = target_ms - now
+        if remain <= 0:
+            break
+        if remain > busy_ms:
+            time.sleep((remain - busy_ms) / 1000)
+        else:
+            time.sleep(remain / 1000)
 
 # ====== OKX API WRAPPERS ======
 def get_top_swaps(n=TOP_N):
@@ -123,13 +153,50 @@ def get_instruments_map():
         mp[it["instId"]] = {
             "lotSz": Decimal(str(it.get("lotSz") or it.get("minSz") or "1")),
             "ctVal": Decimal(str(it.get("ctVal") or "1")),
-            "ctValCcy": it.get("ctValCcy","")
+            "ctValCcy": it.get("ctValCcy", ""),
+            "maxMktSz": Decimal(str(it.get("maxMktSz") or it.get("maxLmtSz") or "0"))
         }
     return mp
 
-def get_candles(instId, limit=300):
-    res = _req("GET", "/api/v5/market/candles", {"instId":instId, "bar":BAR, "limit":limit})
+def get_candles(instId, bar=BAR_STR, limit=300):
+    res = _req("GET", "/api/v5/market/candles", {"instId": instId, "bar": bar, "limit": limit})
     return res.get("data", [])
+
+def trend_ok_1h(instId: str, side: str, fast_len: int = 50, slow_len: int = 200) -> bool:
+    """
+    يسمح بالدخول لو الترند على إطار 1H موافق لاتجاه الصفقة:
+      - شراء: EMA50 > EMA200
+      - بيع : EMA50 < EMA200
+    بنستخدم آخر شمعة مُغلقة (iloc[-2]).
+    """
+    try:
+        candles = get_candles(instId, bar="1H", limit=max(fast_len, slow_len) + 250)
+        if not candles:
+            return False
+        df1h = _to_df(candles)
+        close = df1h["Close"]
+        if HAS_TA:
+            ema_fast = ta.ema(close, length=fast_len)
+            ema_slow = ta.ema(close, length=slow_len)
+        else:
+            ema_fast = close.ewm(span=fast_len, adjust=False).mean()
+            ema_slow = close.ewm(span=slow_len, adjust=False).mean()
+        e_fast = ema_fast.dropna().iloc[-2]
+        e_slow = ema_slow.dropna().iloc[-2]
+        if side.lower() in ("buy", "long", "شراء"):
+            return bool(e_fast > e_slow)
+        else:
+            return bool(e_fast < e_slow)
+    except Exception as e:
+        print(f"[WARN] trend_ok_1h failed for {instId}: {e}")
+        return False
+
+def get_ticker(instId):
+    res = _req("GET", "/api/v5/market/ticker", {"instId": instId})
+    try:
+        return float(res.get("data", [{}])[0].get("last"))
+    except Exception:
+        return None
 
 def place_order(instId, side, sz, reduceOnly=False, tdMode="cross"):
     body = {
@@ -158,22 +225,97 @@ def get_fills(ordId=None, instId=None, limit=100):
     res = _req("GET", "/api/v5/trade/fills", params)
     return res.get("data", [])
 
-# ====== INDICATORS ======
-def indicators(df):
-    if df is None or len(df) < 100:
-        return 50.0, 50.0
-    i = -2 if len(df) >= 2 else -1
-    o,h,l,c = df["Open"], df["High"], df["Low"], df["Close"]
-    v = df.get("Volume")
+def get_usdt_equity():
+    """يرجع إجمالي الإكويتي/الرصيد المتاح بـ USDT من حساب OKX (الديمو/الحقيقي)."""
+    try:
+        r = _req("GET", "/api/v5/account/balance", {"ccy": "USDT"})
+        d = r.get("data", [{}])[0]
+        eq = Decimal(str(d.get("totalEq") or "0"))
+        if eq == 0:
+            for it in d.get("details", []) or []:
+                if it.get("ccy") == "USDT":
+                    val = it.get("availEq") or it.get("eq") or it.get("cashBal")
+                    eq = Decimal(str(val or "0"))
+                    break
+        return max(eq, Decimal("0"))
+    except Exception:
+        return Decimal("0")
 
+
+def get_max_avail_size(instId: str, side: str, tdMode="cross"):
+    res = _req("GET", "/api/v5/account/max-avail-size", {"instId": instId, "tdMode": tdMode})
+    d = (res or {}).get("data", [{}])[0]
+    keys = ["availBuy", "maxBuy"] if side == "buy" else ["availSell", "maxSell"]
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", "0"):
+            try:
+                return Decimal(str(v))
+            except Exception:
+                pass
+    return None
+
+
+def set_leverage_safely(instId, lever, mgnMode="cross"):
+    if _LEVER_CACHE.get(instId) == lever:
+        return {"code": "0"}
+    body = {"instId": instId, "lever": str(lever), "mgnMode": mgnMode}
+    for wait in (0.1, 0.2, 0.4, 0.8, 1.6):
+        res = _req("POST", "/api/v5/account/set-leverage", body)
+        code = str(res.get("code"))
+        if code == "0":
+            _LEVER_CACHE[instId] = lever
+            return res
+        if code == "50011":
+            time.sleep(wait)
+            continue
+        return res
+    return res
+
+
+def money_flow_index_series(h, l, c, v, length=14):
+    h = h.astype("float64"); l = l.astype("float64"); c = c.astype("float64"); v = v.astype("float64")
+    tp = (h + l + c) / 3.0
+    rmf = tp * v
+    up = tp > tp.shift(1)
+    dn = tp < tp.shift(1)
+    pos = rmf.where(up, 0.0).rolling(length).sum()
+    neg = rmf.where(dn, 0.0).rolling(length).sum()
+    mfr = pos / (neg + 1e-12)
+    return 100.0 - (100.0 / (1.0 + mfr))
+
+
+def session_vwap_series(df):
+    vol = df["Volume"].astype("float64")
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    tpv = tp * vol
+    dates = df.index.tz_convert("UTC").date
+    cum_tpv = tpv.groupby(dates).cumsum()
+    cum_v = vol.groupby(dates).cumsum()
+    return cum_tpv / (cum_v + 1e-12)
+
+
+def _parse_max_contracts_51004(msg: str) -> int | None:
+    m = re.search(r"more than\s+([\d,]+)\(contracts\)", msg or "", flags=re.I)
+    return int(m.group(1).replace(",", "")) if m else None
+
+# ====== INDICATORS ======
+def indicators(df, idx):
+    o = df["Open"].astype("float64")
+    h = df["High"].astype("float64")
+    l = df["Low"].astype("float64")
+    c = df["Close"].astype("float64")
+    v = df.get("Volume")
+    if v is not None:
+        v = v.astype("float64")
     votes = []
 
     ema9 = c.ewm(span=9, adjust=False).mean()
     ema21 = c.ewm(span=21, adjust=False).mean()
-    votes.append(1 if ema9.iloc[i] > ema21.iloc[i] else -1)
+    votes.append(1 if ema9.iloc[idx] > ema21.iloc[idx] else -1)
 
     sma20 = c.rolling(20).mean(); sma50 = c.rolling(50).mean()
-    votes.append(0 if (pd.isna(sma20.iloc[i]) or pd.isna(sma50.iloc[i])) else (1 if sma20.iloc[i] > sma50.iloc[i] else -1))
+    votes.append(0 if (pd.isna(sma20.iloc[idx]) or pd.isna(sma50.iloc[idx])) else (1 if sma20.iloc[idx] > sma50.iloc[idx] else -1))
 
     try:
         rsi = ta.rsi(c, length=14) if HAS_TA else None
@@ -182,165 +324,312 @@ def indicators(df):
     if rsi is None:
         d = c.diff(); up = d.clip(lower=0).rolling(14).mean(); dn = -d.clip(upper=0).rolling(14).mean()
         rs = up / (dn + 1e-9); rsi = 100 - (100/(1+rs))
-    rv = rsi.iloc[i]
+    rv = rsi.iloc[idx]
     votes.append(1 if rv>55 else (-1 if rv<45 else 0))
 
-    # Stoch
     if HAS_TA:
-        st = ta.stoch(h,l,c,k=14,d=3)
-        k = st.iloc[:,0]; d_ = st.iloc[:,1]
-        votes.append(1 if (k.iloc[i] > d_.iloc[i] and k.iloc[i] < 80) else (-1 if (k.iloc[i] < d_.iloc[i] and k.iloc[i] > 20) else 0))
+        try:
+            st = ta.stoch(h,l,c,k=14,d=3)
+            k = st.iloc[:,0]; d_ = st.iloc[:,1]
+            votes.append(1 if (k.iloc[idx] > d_.iloc[idx] and k.iloc[idx] < 80) else (-1 if (k.iloc[idx] < d_.iloc[idx] and k.iloc[idx] > 20) else 0))
+        except Exception:
+            votes.append(0)
     else:
         ll = l.rolling(14).min(); hh = h.rolling(14).max()
         k = 100*(c-ll)/(hh-ll+1e-9); d_ = k.rolling(3).mean()
-        votes.append(1 if (k.iloc[i] > d_.iloc[i] and k.iloc[i] < 80) else (-1 if (k.iloc[i] < d_.iloc[i] and k.iloc[i] > 20) else 0))
+        votes.append(1 if (k.iloc[idx] > d_.iloc[idx] and k.iloc[idx] < 80) else (-1 if (k.iloc[idx] < d_.iloc[idx] and k.iloc[idx] > 20) else 0))
 
-    # MACD
     if HAS_TA:
-        mac = ta.macd(c); ml = mac.iloc[:,0]; sg = mac.iloc[:,2]
+        try:
+            mac = ta.macd(c); ml = mac.iloc[:,0]; sg = mac.iloc[:,2]
+            votes.append(1 if ml.iloc[idx] > sg.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
     else:
         ema12 = c.ewm(span=12, adjust=False).mean(); ema26 = c.ewm(span=26, adjust=False).mean()
         ml = ema12 - ema26; sg = ml.ewm(span=9, adjust=False).mean()
-    votes.append(1 if ml.iloc[i] > sg.iloc[i] else -1)
+        votes.append(1 if ml.iloc[idx] > sg.iloc[idx] else -1)
 
-    # BB basis
     basis = c.rolling(20).mean()
-    votes.append(1 if c.iloc[i] > basis.iloc[i] else -1)
+    votes.append(1 if c.iloc[idx] > basis.iloc[idx] else -1)
 
-    # DMI/ADX
     if HAS_TA:
-        adx = ta.adx(h,l,c,length=14)
-        plusd, minusd, ax = adx["DMP_14"], adx["DMN_14"], adx["ADX_14"]
-        votes.append(0 if ax.iloc[i] < 20 else (1 if plusd.iloc[i] > minusd.iloc[i] else -1))
+        try:
+            adx = ta.adx(h,l,c,length=14)
+            plusd, minusd, ax = adx["DMP_14"], adx["DMN_14"], adx["ADX_14"]
+            votes.append(0 if ax.iloc[idx] < 20 else (1 if plusd.iloc[idx] > minusd.iloc[idx] else -1))
+        except Exception:
+            votes.append(0)
     else:
         votes.append(0)
 
-    # CCI
     if HAS_TA:
-        cci = ta.cci(h,l,c,length=20).iloc[i]
-        votes.append(1 if cci>0 else (-1 if cci<0 else 0))
+        try:
+            cci = ta.cci(h,l,c,length=20).iloc[idx]
+            votes.append(1 if cci>0 else (-1 if cci<0 else 0))
+        except Exception:
+            votes.append(0)
     else:
         votes.append(0)
 
-    # Heikin Ashi
     ha_c = (o+h+l+c)/4.0
     ha_o = ha_c.copy()
-    for idx in range(1, len(df)):
-        ha_o.iloc[idx] = (ha_o.iloc[idx-1] + ha_c.iloc[idx-1]) / 2.0
-    votes.append(1 if ha_c.iloc[i] > ha_o.iloc[i] else -1)
+    for j in range(1, len(df)):
+        ha_o.iloc[j] = (ha_o.iloc[j-1] + ha_c.iloc[j-1]) / 2.0
+    votes.append(1 if ha_c.iloc[idx] > ha_o.iloc[idx] else -1)
 
-    # Ichimoku
     conv = (h.rolling(9).max()+l.rolling(9).min())/2.0
     base = (h.rolling(26).max()+l.rolling(26).min())/2.0
     span_a = ((conv+base)/2.0).shift(26)
     span_b = ((h.rolling(52).max()+l.rolling(52).min())/2.0).shift(26)
     top = pd.concat([span_a, span_b], axis=1).max(axis=1)
     bot = pd.concat([span_a, span_b], axis=1).min(axis=1)
-    if pd.isna(top.iloc[i]) or pd.isna(bot.iloc[i]):
+    if pd.isna(top.iloc[idx]) or pd.isna(bot.iloc[idx]):
         votes.append(0)
     else:
-        votes.append(1 if c.iloc[i] > top.iloc[i] else (-1 if c.iloc[i] < bot.iloc[i] else 0))
+        votes.append(1 if c.iloc[idx] > top.iloc[idx] else (-1 if c.iloc[idx] < bot.iloc[idx] else 0))
 
-    # Supertrend
     if HAS_TA:
-        st = ta.supertrend(h,l,c,length=10,multiplier=3.0)
-        dcol = [x for x in st.columns if x.startswith("SUPERTd_")]
-        votes.append(1 if st[dcol[0]].iloc[i] > 0 else -1)
-    else: votes.append(0)
+        try:
+            st = ta.supertrend(h,l,c,length=10,multiplier=3.0)
+            dcol = [x for x in st.columns if x.startswith("SUPERTd_")]
+            votes.append(1 if st[dcol[0]].iloc[idx] > 0 else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # Keltner
     if HAS_TA:
-        kc = ta.kc(h,l,c,length=20); mid = kc.iloc[:,1]
-        votes.append(1 if c.iloc[i] > mid.iloc[i] else -1)
-    else: votes.append(0)
+        try:
+            kc = ta.kc(h,l,c,length=20); mid = kc.iloc[:,1]
+            votes.append(1 if c.iloc[idx] > mid.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # Williams %R
     if HAS_TA:
-        wr = ta.willr(h,l,c,length=14).iloc[i]
-        votes.append(1 if wr > -50 else (-1 if wr < -50 else 0))
-    else: votes.append(0)
+        try:
+            wr = ta.willr(h,l,c,length=14).iloc[idx]
+            votes.append(1 if wr > -50 else (-1 if wr < -50 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # MFI
-    if HAS_TA and "Volume" in df.columns:
-        mfi = ta.mfi(h,l,c,df["Volume"], length=14).iloc[i]
-        votes.append(1 if mfi > 50 else (-1 if mfi < 50 else 0))
-    else: votes.append(0)
+    if v is not None:
+        try:
+            mfi_val = float(money_flow_index_series(h, l, c, v, 14).iloc[idx])
+            votes.append(1 if mfi_val > 50 else (-1 if mfi_val < 50 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # ROC
     if HAS_TA:
-        rv = ta.roc(c,length=9).iloc[i]
-        votes.append(1 if rv > 0 else (-1 if rv < 0 else 0))
-    else: votes.append(0)
+        try:
+            rv = ta.roc(c,length=9).iloc[idx]
+            votes.append(1 if rv > 0 else (-1 if rv < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # Aroon
     if HAS_TA:
-        ar = ta.aroon(h,l,length=14); up = ar.iloc[:,0]; dn = ar.iloc[:,1]
-        votes.append(1 if up.iloc[i] > dn.iloc[i] else -1)
-    else: votes.append(0)
+        try:
+            ar = ta.aroon(h,l,length=14); up = ar.iloc[:,0]; dn = ar.iloc[:,1]
+            votes.append(1 if up.iloc[idx] > dn.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # TSI
     if HAS_TA:
-        tv = ta.tsi(c).iloc[i]
-        votes.append(1 if tv > 0 else (-1 if tv < 0 else 0))
-    else: votes.append(0)
+        try:
+            tv = ta.tsi(c).iloc[idx]
+            votes.append(1 if tv > 0 else (-1 if tv < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # OBV delta
-    if HAS_TA and "Volume" in df.columns:
-        dv = ta.obv(c, df["Volume"]).diff().iloc[i]
-        votes.append(1 if dv > 0 else -1)
-    else: votes.append(0)
+    if HAS_TA and v is not None:
+        try:
+            dv = ta.obv(c, v).diff().iloc[idx]
+            votes.append(1 if dv > 0 else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # HMA slope
     if HAS_TA:
-        hma = ta.hma(c,length=55)
-        votes.append(1 if hma.iloc[i] > hma.shift(1).iloc[i] else -1)
-    else: votes.append(0)
+        try:
+            hma = ta.hma(c,length=55)
+            votes.append(1 if hma.iloc[idx] > hma.shift(1).iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    # PSAR
     if HAS_TA:
-        ps = ta.psar(h,l,c)
-        pcol = [x for x in ps.columns if x.startswith("PSAR")]
-        pv = ps[pcol[0]].iloc[i]
-        votes.append(1 if c.iloc[i] > pv else -1)
-    else: votes.append(0)
+        try:
+            ps = ta.psar(h,l,c)
+            pcol = [x for x in ps.columns if x.startswith("PSAR")]
+            pv = ps[pcol[0]].iloc[idx]
+            votes.append(1 if c.iloc[idx] > pv else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
 
-    bulls = sum(1 for v in votes if v==1)
-    bears = sum(1 for v in votes if v==-1)
+    # 21) EMA 50/200 cross
+    ema50 = c.ewm(span=50, adjust=False).mean()
+    ema200 = c.ewm(span=200, adjust=False).mean()
+    votes.append(1 if ema50.iloc[idx] > ema200.iloc[idx] else -1)
+
+    # 22) SMA100 slope
+    sma100 = c.rolling(100).mean()
+    if pd.isna(sma100.iloc[idx]) or pd.isna(sma100.shift(1).iloc[idx]):
+        votes.append(0)
+    else:
+        votes.append(1 if sma100.iloc[idx] > sma100.shift(1).iloc[idx] else -1)
+
+    # 23) VWAP session
+    if v is not None:
+        try:
+            vwap = float(session_vwap_series(df).iloc[idx])
+            votes.append(1 if c.iloc[idx] > vwap else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 24) Donchian(20) mid
+    try:
+        upper = h.rolling(20).max(); lower = l.rolling(20).min(); mid = (upper+lower)/2
+        if pd.isna(mid.iloc[idx]):
+            votes.append(0)
+        else:
+            votes.append(1 if c.iloc[idx] > mid.iloc[idx] else -1)
+    except Exception:
+        votes.append(0)
+
+    # 25) KAMA(10) slope
+    if HAS_TA:
+        try:
+            kama = ta.kama(c,length=10)
+            if pd.isna(kama.iloc[idx]) or pd.isna(kama.shift(1).iloc[idx]):
+                votes.append(0)
+            else:
+                votes.append(1 if kama.iloc[idx] > kama.shift(1).iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 26) PPO(12,26,9)
+    if HAS_TA:
+        try:
+            ppo = ta.ppo(c)
+            line = ppo.iloc[:,0]; sig = ppo.iloc[:,1]
+            votes.append(1 if line.iloc[idx] > sig.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 27) Ultimate Oscillator
+    if HAS_TA:
+        try:
+            uo = ta.uo(h,l,c).iloc[idx]
+            votes.append(1 if uo > 50 else (-1 if uo < 50 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 28) Chaikin Money Flow
+    if HAS_TA and v is not None:
+        try:
+            cmf = ta.cmf(h,l,c,v,length=20).iloc[idx]
+            votes.append(1 if cmf > 0 else (-1 if cmf < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 29) Vortex(14)
+    if HAS_TA:
+        try:
+            vx = ta.vortex(h,l,c,length=14)
+            vplus = vx.iloc[:,0]; vminus = vx.iloc[:,1]
+            if pd.isna(vplus.iloc[idx]) or pd.isna(vminus.iloc[idx]):
+                votes.append(0)
+            else:
+                votes.append(1 if vplus.iloc[idx] > vminus.iloc[idx] else -1)
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    # 30) TRIX(30)
+    if HAS_TA:
+        try:
+            tr = ta.trix(c,length=30).iloc[idx]
+            votes.append(1 if tr > 0 else (-1 if tr < 0 else 0))
+        except Exception:
+            votes.append(0)
+    else:
+        votes.append(0)
+
+    return votes
+
+def decide(instId):
+    df = _to_df(get_candles(instId, limit=300))
+    if df is None or len(df) < 100:
+        return None
+    idx = -2 if len(df) >= 2 else -1
+    votes = indicators(df, idx)
+    bulls = votes.count(1)
+    bears = votes.count(-1)
     eff = bulls + bears
     bull_pct = 100.0 * bulls/eff if eff>0 else 50.0
     bear_pct = 100.0 - bull_pct
-    return bull_pct, bear_pct
-
-def decide(instId):
-    df = _to_df(get_candles(instId, 300))
-    if df is None or len(df) < 100:
+    side = "buy" if bull_pct >= bear_pct else "sell"
+    score = bull_pct if side=="buy" else bear_pct
+    last_close = float(df["Close"].iloc[idx])
+    if score < CONSENSUS_THRESHOLD:
         return None
-    bull, bear = indicators(df)
-    side = "buy" if bull >= bear else "sell"
-    score = bull if side=="buy" else bear
-    last_close = float(df["Close"].iloc[-2])
-    return {"instId": instId, "bull": bull, "bear": bear, "side": side, "score": score, "px": last_close}
+    if not trend_ok_1h(instId, side):
+        return None
+    return {
+        "instId": instId,
+        "bull": bull_pct,
+        "bear": bear_pct,
+        "side": side,
+        "score": score,
+        "px": last_close
+    }
 
 def quantize_to_step(value: Decimal, step: Decimal) -> Decimal:
     steps = (value / step).to_integral_value(rounding=ROUND_DOWN)
     q = (steps * step).normalize()
-    # ensure non-zero
-    if q <= Decimal("0"):
-        q = step
     return q
 
+def clamp_order_size(inst_info: dict, sz: Decimal) -> Decimal:
+    lot = inst_info.get("lotSz", Decimal("1"))
+    max_mkt = inst_info.get("maxMktSz", Decimal("0"))
+    if max_mkt > 0 and sz > max_mkt:
+        sz = max_mkt
+    sz = quantize_to_step(sz, lot)
+    return max(sz, Decimal("0"))
+
 def compute_size(px_float: float, lotSz: Decimal, ctVal: Decimal, notional: Decimal) -> str:
-    # contracts = notional / (price * ctVal)
     px = Decimal(str(px_float))
     raw = notional / (px * (ctVal if ctVal > 0 else Decimal("1e-9")))
     q = quantize_to_step(raw, lotSz)
-    # format to the same number of decimals as lotSz
     lot_decimals = max(0, -lotSz.as_tuple().exponent)
     return f"{q:.{lot_decimals}f}"
-
-def seconds_until_bar_end():
-    # After opening trade at bar start, wait till next 5m boundary to close
-    return seconds_to_next_5m()
 
 def avg_fill_price_and_qty(ordId):
     fills = get_fills(ordId=ordId)
@@ -361,81 +650,190 @@ def avg_fill_price_and_qty(ordId):
     avg_px = (total_notional / total_q)
     return float(avg_px), float(total_q)
 
+# ====== MAIN LOOP ======
 def main():
     if not (API_KEY and API_SECRET and API_PASSPHRASE):
         print("[ERR] Set API credentials"); return
-
-    ids = get_top_swaps(TOP_N)
     info = get_instruments_map()
-    print(f"[INIT] Top {len(ids)}: {', '.join(ids)}")
-
+    hour_pnl_pos = Decimal("0")   # مجموع الأرباح الموجبة داخل الساعة
+    hour_pnl_neg = Decimal("0")   # مجموع الخسائر (قيم سالبة) داخل الساعة
+    next_hour_ms = next_hour_boundary_ms()
     while True:
-        # wait to new bar start
-        time.sleep(seconds_to_next_5m())
-
-        # evaluate all and send TG summary
-        decisions = []
-        lines = []
+        now_ms = server_time_ms()
+        if now_ms >= next_hour_ms:
+            net = (hour_pnl_pos + hour_pnl_neg)
+            _send_tg(
+                f"[ملخص الساعة] ربح إجمالي: {hour_pnl_pos:.2f} USDT | "
+                f"خسارة إجمالية: {abs(hour_pnl_neg):.2f} USDT | "
+                f"الصافي: {net:.2f} USDT"
+            )
+            hour_pnl_pos = Decimal("0")
+            hour_pnl_neg = Decimal("0")
+            next_hour_ms = next_hour_boundary_ms(now_ms)
+        next_ms = next_bar_boundary_ms(now_ms)
+        prep_wait = next_ms - PREP_MS - now_ms
+        if prep_wait > 0:
+            time.sleep(prep_wait/1000)
+        ids = get_top_swaps(TOP_N)
+        lever_int = int(LEVERAGE)
         for instId in ids:
-            d = decide(instId)
-            if d:
-                decisions.append(d)
-                lines.append(f"{instId}: Bull {d['bull']:.1f}% | Bear {d['bear']:.1f}% ⇒ {d['side'].upper()} (score {d['score']:.1f}%)")
+            try:
+                set_leverage_safely(instId, lever_int, "cross")
+            except Exception:
+                pass
+        decisions = []
+        for instId in ids:
+            try:
+                d = decide(instId)
+                if d:
+                    decisions.append(d)
+            except Exception:
+                continue
+        decisions.sort(key=lambda x: x["score"], reverse=True)
+        boundary_time = datetime.fromtimestamp(next_ms/1000, tz=timezone.utc).isoformat()
         if decisions:
-            _send_tg("[5m SUMMARY]\\n" + "\\n".join(lines))
+            lines = []
+            for idx, d in enumerate(decisions,1):
+                dir_ar = "شراء" if d['side']=="buy" else "بيع"
+                lines.append(f"{idx}) {d['instId']}: Bull {d['bull']:.1f}% | Bear {d['bear']:.1f}% ⇒ {dir_ar} (score {d['score']:.1f}%) [✓1H]")
+            _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\n" + "\n".join(lines))
         else:
-            _send_tg("[5m SUMMARY] No valid data."); 
+            _send_tg(f"ملخّص 15m — {boundary_time} (يدخل بعد أقل من ثانية)\nلا بيانات")
+        trade = None
+        if decisions:
+            best = decisions[0]
+            inst_info = info.get(best["instId"], {})
+            lotSz = inst_info.get("lotSz", Decimal("1"))
+            ctVal = inst_info.get("ctVal", Decimal("1"))
+            max_mkt = inst_info.get("maxMktSz", Decimal("0"))
+            print(f"[INFO] {best['instId']} lotSz={lotSz} ctVal={ctVal} maxMktSz={max_mkt}")
+            lot_decimals = max(0, -lotSz.as_tuple().exponent)
+            equity = get_usdt_equity()
+            notional_90 = (equity * TRADE_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            max_notional = (equity * LEVERAGE * SAFETY).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            final_notional = notional_90 if notional_90 < max_notional else max_notional
+            if final_notional <= Decimal("0.00"):
+                _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
+            else:
+                last_px = get_ticker(best["instId"]) or best["px"]
+                pre_sz_str = compute_size(last_px, lotSz, ctVal, final_notional)
+                pre_sz_dec = clamp_order_size(inst_info, Decimal(pre_sz_str))
+                if pre_sz_dec > 0:
+                    trade = {
+                        "best": best,
+                        "inst_info": inst_info,
+                        "lotSz": lotSz,
+                        "lot_decimals": lot_decimals,
+                        "ctVal": ctVal,
+                        "sz_dec": pre_sz_dec,
+                        "sz_str": f"{pre_sz_dec:.{lot_decimals}f}",
+                    }
+                else:
+                    _send_tg(f"[SKIP] eq={equity} notional90={notional_90} final={final_notional}")
+        wait_until(next_ms, BUSY_WAIT_MS)
+        if not trade:
             continue
-
-        # pick the highest consensus
-        best = max(decisions, key=lambda x: x["score"])
-
-        # compute order size (contracts) using lotSz & ctVal
-        lotSz = info.get(best["instId"],{}).get("lotSz", Decimal("1"))
-        ctVal = info.get(best["instId"],{}).get("ctVal", Decimal("1"))
-        sz_str = compute_size(best["px"], lotSz, ctVal, NOTIONAL_USDT)
-
+        best = trade["best"]
+        inst_info = trade["inst_info"]
+        lotSz = trade["lotSz"]
+        lot_decimals = trade["lot_decimals"]
+        ctVal = trade["ctVal"]
+        sz_dec = trade["sz_dec"]
+        sz_str = trade["sz_str"]
+        max_avail = get_max_avail_size(best["instId"], best["side"], "cross")
+        if max_avail is not None:
+            sz_dec = clamp_order_size(inst_info, min(sz_dec, max_avail))
+            sz_str = f"{sz_dec:.{lot_decimals}f}"
+            if sz_dec <= 0:
+                _send_tg(f"[SKIP] max_avail too small")
+                continue
+        set_leverage_safely(best["instId"], lever_int, "cross")
         ok, ordId, resp = place_order(best["instId"], best["side"], sz_str, reduceOnly=False)
+        data = resp.get("data", [{}])[0]
+        if not ok:
+            s_code = str(data.get("sCode"))
+            s_msg = data.get("sMsg", "")
+            hard_cap = _parse_max_contracts_51004(s_msg) if s_code == "51004" else None
+            if s_code in ("51008", "51004"):
+                cur_size = Decimal(sz_str)
+                if hard_cap is not None:
+                    cur_size = min(cur_size, Decimal(str(hard_cap)))
+                for _ in range(RETRIES_51008):
+                    new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                    new_size = clamp_order_size(inst_info, new_size)
+                    if hard_cap is not None:
+                        new_size = min(new_size, Decimal(str(hard_cap)))
+                    if new_size <= 0:
+                        break
+                    old_str = f"{cur_size:.{lot_decimals}f}"
+                    new_str = f"{new_size:.{lot_decimals}f}"
+                    _send_tg(f"[RETRY-{s_code}] {best['instId']} size={old_str} -> {new_str}")
+                    set_leverage_safely(best["instId"], lever_int, "cross")
+                    ok, ordId, resp = place_order(best["instId"], best["side"], new_str, reduceOnly=False)
+                    cur_size = new_size
+                    sz_str = new_str
+                    if ok:
+                        break
+                data = resp.get("data", [{}])[0]
         if not ok:
             _send_tg(f"[OPEN-FAILED] {best['instId']} {best['side'].upper()} sz={sz_str} resp={resp}")
             continue
-
-        # get entry fill price & qty
         entry_px, entry_q = avg_fill_price_and_qty(ordId)
         if entry_px is None:
-            entry_px = best["px"]  # fallback to last close
+            entry_px = best['px']
         if entry_q is None:
             try: entry_q = Decimal(sz_str)
             except: entry_q = Decimal("0")
-
-        _send_tg(f"[OPEN] {best['instId']} {best['side'].upper()} ordId={ordId} sz={sz_str} px≈{entry_px}")
-
-        # wait till end of bar and close reduceOnly
-        time.sleep(seconds_until_bar_end() or 298)  # safety fallback
-
+        _send_tg(f"[OPEN] {best['instId']} {best['side'].upper()} ordId={ordId} sz={sz_str} px≈{entry_px} score={best['score']:.1f}%")
+        open_ms = next_ms
+        close_ms = open_ms + BAR_SECONDS*1000 - CLOSE_EARLY_MS
+        wait_until(close_ms, BUSY_WAIT_MS)
         close_side = "sell" if best["side"]=="buy" else "buy"
         ok2, ordId2, resp2 = place_order(best["instId"], close_side, sz_str, reduceOnly=True)
+        data2 = resp2.get("data", [{}])[0]
+        if not ok2:
+            s_code2 = str(data2.get("sCode"))
+            s_msg2 = data2.get("sMsg", "")
+            hard_cap = _parse_max_contracts_51004(s_msg2) if s_code2 == "51004" else None
+            if s_code2 in ("51008", "51004"):
+                cur_size = Decimal(sz_str)
+                if hard_cap is not None:
+                    cur_size = min(cur_size, Decimal(str(hard_cap)))
+                for _ in range(RETRIES_51008):
+                    new_size = quantize_to_step(cur_size * SHRINK_FACTOR, lotSz)
+                    new_size = clamp_order_size(inst_info, new_size)
+                    if hard_cap is not None:
+                        new_size = min(new_size, Decimal(str(hard_cap)))
+                    if new_size <= 0:
+                        break
+                    old_str = f"{cur_size:.{lot_decimals}f}"
+                    new_str = f"{new_size:.{lot_decimals}f}"
+                    _send_tg(f"[RETRY-{s_code2}] {best['instId']} size={old_str} -> {new_str}")
+                    set_leverage_safely(best["instId"], lever_int, "cross")
+                    ok2, ordId2, resp2 = place_order(best["instId"], close_side, new_str, reduceOnly=True)
+                    cur_size = new_size
+                    sz_str = new_str
+                    if ok2:
+                        break
+                data2 = resp2.get("data", [{}])[0]
         if not ok2:
             _send_tg(f"[CLOSE-FAILED] {best['instId']} resp={resp2}")
             continue
-
         exit_px, exit_q = avg_fill_price_and_qty(ordId2)
         if exit_px is None:
-            # fetch latest candle close as fallback
-            d2 = decide(best["instId"])
-            exit_px = d2["px"] if d2 else entry_px
+            d2 = decide(best['instId'])
+            exit_px = d2['px'] if d2 else entry_px
         if exit_q is None:
             try: exit_q = Decimal(sz_str)
             except: exit_q = Decimal("0")
-
-        # compute P&L in USDT (approx; fees excluded)
-        # Linear USDT-margined: PnL = (exit - entry) * sign * ctVal * qty
-        sign = Decimal("1") if best["side"]=="buy" else Decimal("-1")
-        qty_used = Decimal(str(min(float(entry_q), float(exit_q))))
+        sign = Decimal("1") if best['side']=="buy" else Decimal("-1")
+        qty_used = Decimal(str(min(float(entry_q or 0), float(exit_q or 0))))
         pnl = (Decimal(str(exit_px)) - Decimal(str(entry_px))) * sign * ctVal * qty_used
-
-        result = "ربح ✅" if pnl > 0 else ("خسارة ❌" if pnl < 0 else "متعادل •")
-        _send_tg(f"[CLOSE] {best['instId']} {close_side.upper()} ordId={ordId2} px≈{exit_px}\\nالنتيجة: {result} | PnL≈ {pnl:.4f} USDT")
+        _send_tg(f"[CLOSE] {best['instId']} {close_side.upper()} ordId={ordId2} px≈{exit_px}\nPnL≈ {pnl:.4f} USDT")
+        if pnl > 0:
+            hour_pnl_pos += pnl
+        elif pnl < 0:
+            hour_pnl_neg += pnl
 
 if __name__ == "__main__":
     main()
